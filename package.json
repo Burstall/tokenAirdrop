@@ -1,0 +1,25 @@
+{
+  "name": "tokenairdrop",
+  "version": "0.0.1",
+  "description": "Tools to airdrop tokens",
+  "main": "tokenAirdrop.js",
+  "type": "module",
+  "scripts": {
+    "test": "node tokenAirdrop.js -h"
+  },
+  "keywords": [
+    "hbar",
+    "airdrop",
+    "NFT"
+  ],
+  "author": "Stowerling",
+  "license": "ISC",
+  "dependencies": {
+    "@hashgraph/sdk": "^2.11.3",
+    "cross-fetch": "^3.1.5",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.17.0"
+  }
+}
