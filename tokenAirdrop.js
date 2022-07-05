@@ -12,8 +12,10 @@ import { exit } from 'process';
 const maxRetries = 10;
 let verbose = false;
 const memo = process.env.MEMO || 'Airdrop';
+const env = process.env.ENVIRONMENT ?? null;
 const dbHeaders = '#destWallet,tokenToSend,quantity,serial\n';
-const baseUrl = 'https://mainnet-public.mirrornode.hedera.com';
+const baseUrlForMainnet = 'https://mainnet-public.mirrornode.hedera.com';
+const baseUrlForTestnet = 'http://testnet.mirrornode.hedera.com';
 
 /*
 Read in the flat file Database
@@ -71,20 +73,18 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 		let lineNum = 0;
 
 		const allFileContents = fs.readFileSync(fileToProcess, 'utf-8');
-		allFileContents.split(/\r?\n/).forEach(async (line) => {
+		const lines = allFileContents.split(/\r?\n/);
+		for (let l = 0; l < lines.length; l++) {
+			const line = lines[l];
 			// discard if headers [i.e. does not start with 0. for wallet ID]
 			// also remove attempts ot pay yourself
 			lineNum++;
 			if (!/^0.0.[1-9][0-9]+,/i.test(line)) {
 				console.log(`DB: Skipping line ${lineNum} - poorly formed wallet address: ${line}`);
-				return;
+				continue;
 			}
-
-			const elements = line.split(',');
-			const receiverWallet = elements[0];
-			const tokenId = elements[1];
-			const quantity = elements[2];
-			const serialArray = (elements[3] || '0').split(',');
+			const [receiverWallet, tokenId, quantity, ...rest] = line.split(',');
+			const serialArray = rest.length == 0 ? [0] : rest;
 
 			let tokenBalMap = tokenBalancesMaps.get(tokenId) || null;
 			if (tokenBalMap == null) {
@@ -92,7 +92,8 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 				tokenBalMap = await getTokenBalanceMap(tokenId);
 				tokenBalancesMaps.set(tokenId, tokenBalMap);
 			}
-			const walletAssociated = tokenBalMap.get(receiverWallet) ? true : false;
+
+			const walletAssociated = tokenBalMap.get(receiverWallet) >= 0 ? true : false;
 
 			let amt = userAmtMap.get(receiverWallet) || 0;
 			if (excludeWalletsList.includes(receiverWallet)) {
@@ -122,13 +123,11 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 			else {
 				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, '', false);
 				tokenTransfers.push(tx);
-				// tokenTransfers.push([receiverWallet, tokenId, quantity, serial, '', false]);
 				amt += quantity;
 			}
 			userAmtMap.set(receiverWallet, amt);
-		}).then(() => {
-			return [tokenTransfers, skippedTfrs, tokenBalancesMaps];
-		});
+		}
+		return [tokenTransfers, skippedTfrs, tokenBalancesMaps];
 	}
 	catch (err) {
 		console.log('ERROR: Could not read DB', err);
@@ -175,21 +174,32 @@ class Transaction {
 		this.receiverWallet = recieverWallet;
 		this.tokenId = tokenId;
 		this.quantity = quantity;
-		this.serialArray = serialArray;
-		this.message = msg;
-		this.success = success;
-
-		let serialString = '';
-		for (let s = 0; s < serialArray.length; s++) {
-			if (s > 0) {
-				serialString += ',' + serialArray[s];
-			}
-			else {
-				serialString += serialArray[s];
-			}
+		this.serialArray = [];
+		const sA = serialArray.slice(0, quantity);
+		// cast to ensure Numbers
+		for (let s = 0; s < sA.length; s++) {
+			this.serialArray.push(Number(sA[s]));
 		}
 
-		this.serialString = serialString;
+		// ensure serial array is as long as the qty
+		while (this.serialArray.length < this.quantity) {
+			this.serialArray.push(0);
+		}
+		this.message = msg;
+		this.success = success;
+	}
+
+	getSerialString() {
+		let serialString = '';
+		for (let s = 0; s < this.serialArray.length; s++) {
+			if (s > 0) {
+				serialString += ',' + this.serialArray[s];
+			}
+			else {
+				serialString += this.serialArray[s];
+			}
+		}
+		return serialString;
 	}
 
 	toString() {
@@ -202,7 +212,6 @@ class Transaction {
 }
 
 async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test) {
-	if (verbose) console.log(tfrArray);
 
 	if (tfrArray.length == 0) {
 		console.log('No transfers sent for processing - BUGGING OUT');
@@ -282,7 +291,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 				// check that the serials requested are not on exclude list
 				// else it becomes a skipped tx
 				// N.B. can be a comma seperated list
-				const serialArray = tfr.serial.split(',');
+				const serialArray = tfr.serialArray;
 				const anyExcludedSerials = serialArray.some(s => excludeSerialsList.includes(s));
 				if (anyExcludedSerials) {
 					// error Tx
@@ -291,6 +300,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 					continue;
 				}
 				// now check the sender owns that serial if specified
+				let serialCheckPassed = true;
 				for (let s = 0; s < serialArray.length; s++) {
 					const serial = serialArray[s];
 					// 0 = any serial so always passes
@@ -299,22 +309,27 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 					}
 					else {
 						// we need to check sender owns the serial
-						const serialsOwned = serialsOwnedMap(tokenId);
-						if (!serialsOwned.includes(serial)) {
+						const serialsOwned = serialsOwnedMap.get(tokenId);
+						const indexOfSerial = serialsOwned.indexOf(serial);
+						if (indexOfSerial < 0) {
 							console.log(`[ERROR]: sender (${senderAccountId}) does not own serial (${serial}) of token (${tokenId}) specified to send to ${tfr.receiverWallet}`);
-							tfr.message = `ERROR: requested to send a serial not owned ${tokenId} / #${serial}`;
+							tfr.message = tfr.message + `ERROR: requested to send a serial not owned ${tokenId} / #${serial} `;
 							skippedTfr.push(tfr);
-							continue;
+							serialCheckPassed = false;
+						}
+						else if (serialsOwned instanceof Array) {
+							// need to remove the serial to avoid it being randomly allocated to another tx
+							serialsOwned.splice(indexOfSerial, 1);
 						}
 					}
 				}
-				nftTokenTfr.push(tfr);
+				if (serialCheckPassed) nftTokenTfr.push(tfr);
 			}
 			else {
 				fungibleTokenTfr.push(tfr);
 			}
 
-			const totalQty = (tokenQtyMap.get(tokenId) || 0) + tfr.quantity;
+			const totalQty = (tokenQtyMap.get(tokenId) || 0) + Number(tfr.quantity);
 
 			tokenQtyMap.set(tokenId, totalQty);
 		}
@@ -325,7 +340,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	for (let t = 0; t < tokenArray.length; t++) {
 		const tokenId = tokenArray[t];
 		const requiredAmt = tokenQtyMap.get(tokenId);
-		const ownedAmt = tokenBalancesMaps.get(tokenId);
+		const ownedAmt = tokenBalancesMaps.get(tokenId).get(senderAccountId);
 		if (requiredAmt > ownedAmt) {
 			console.log(`[INFO]: Sending ${requiredAmt} / owned ${ownedAmt} -> **FAILED**`);
 			enoughTokens = false;
@@ -356,11 +371,11 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 					// serials array is shuffeld upon collection
 					const serialsAvailable = serialsOwnedMap.get(tfr.tokenId);
 					serial = serialsAvailable.pop();
-					serialsOwnedMap.set(tfr.tokenId, serialsAvailable);
+					serialArr.splice(s, 1, serial);
 				}
 			}
 
-			console.log(`[INFO]: NFT transfer to ${tfr.receiverWallet} for ${tfr.quantity} of ${tfr.tokenId} [serials ${tfr.serialString} selected]`);
+			console.log(`[INFO]: NFT transfer to ${tfr.receiverWallet} for ${tfr.quantity} of ${tfr.tokenId} [serial(s) ${tfr.getSerialString()} selected]`);
 		}
 	}
 	// now fungible commons
@@ -371,6 +386,13 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 		}
 	}
 
+	for (let skp = 0; skp < skippedTfr.length; skp++) {
+		const tfr = skippedTfr[skp];
+		if (tfr instanceof Transaction) {
+			console.log('[INFO]: Skipped in pre-flight check', tfr.toString());
+		}
+	}
+
 	if (test) {
 		console.log('TEST MODE: Exiting');
 		exit(0);
@@ -378,7 +400,6 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 
 	// get details for Hedera network
 	const myPrivateKey = PrivateKey.fromString(process.env.MY_PRIVATE_KEY);
-	const env = process.env.ENVIRONMENT;
 
 	// If we weren't able to grab it, we should throw a new error
 	if (senderAccountId == null ||
@@ -531,6 +552,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 async function getTokenBalanceMap(tokenId) {
 
 	let routeUrl = '/api/v1/tokens/' + tokenId + '/balances/';
+	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
 	const tokenBalMap = new Map();
 	try {
 		do {
@@ -542,8 +564,9 @@ async function getTokenBalanceMap(tokenId) {
 			}
 
 			for (let b = 0 ; b < json.balances.length; b++) {
-				const account = b.account;
-				const balance = b.balance;
+				const entry = json.balances[b];
+				const account = entry.account;
+				const balance = entry.balance;
 
 				tokenBalMap.set(account, balance);
 			}
@@ -562,10 +585,12 @@ async function getTokenBalanceMap(tokenId) {
 }
 
 async function getSerialsOwned(tokenId, wallet, excludeSerialsList = []) {
-	console.log('Fetching serials owned: ', baseUrl + routeUrl);
+	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
 
 	const serialArr = [];
 	let routeUrl = '/api/v1/tokens/' + tokenId + '/nfts?account.id=' + wallet;
+
+	console.log('Fetching serials owned: ', baseUrl + routeUrl);
 
 	try {
 		do {
@@ -592,6 +617,7 @@ async function getSerialsOwned(tokenId, wallet, excludeSerialsList = []) {
 }
 
 async function getTokenType(tokenId) {
+	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
 	const routeUrl = `/api/v1/tokens/${tokenId}`;
 
 	const tokenDetailJSON = await fetchJson(baseUrl + routeUrl);
@@ -702,7 +728,7 @@ async function main() {
 	}
 
 	// read in file to process
-	const [tfrArray, skippedTfrs, tokenBalancesMaps] = await readDB(processFile, maxTferAmt, excludeWalletsList);
+	const [tfrArray, skippedTfrs, tokenBalancesMaps] = await readDB(processFile, maxTferAmt, excludeWalletsList) ?? [[], [], new Map()];
 
 	const excludeSerialsEnv = process.env.EXCLUDE_SERIALS || null;
 	const excludeSerialsList = [];
@@ -716,15 +742,20 @@ async function main() {
 		// inclusive range
 			const rangeSplit = excludeSerialsEnv.split('-');
 			for (let i = rangeSplit[0]; i <= rangeSplit[1]; i++) {
-				excludeSerialsList.push(`${i}`);
+				excludeSerialsList.push(i);
 			}
 		}
 		else if (excludeSerialsEnv.includes(',')) {
-			excludeSerialsList.concat(excludeSerialsEnv.split(','));
+			const csvSplit = excludeSerialsEnv.split(',');
+			for (let i = 0; i <= csvSplit.length; i++) {
+				const serial = Number(csvSplit[i]);
+				// ignore NaN / trailing junk
+				if (serial) excludeSerialsList.push(serial);
+			}
 		}
 		else {
 		// only one serial to check
-			excludeSerialsList.push(excludeSerialsEnv);
+			excludeSerialsList.push(Number(excludeSerialsEnv));
 		}
 		console.log('Serials marked for exclusion', excludeSerialsList);
 	}
