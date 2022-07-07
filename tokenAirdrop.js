@@ -83,7 +83,8 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 				console.log(`DB: Skipping line ${lineNum} - poorly formed wallet address: ${line}`);
 				continue;
 			}
-			const [receiverWallet, tokenId, quantity, ...rest] = line.split(',');
+			const [receiverWallet, tokenId, qty, ...rest] = line.split(',');
+			const quantity = Number(qty);
 			const serialArray = rest.length == 0 ? [0] : rest;
 
 			let tokenBalMap = tokenBalancesMaps.get(tokenId) || null;
@@ -339,7 +340,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	for (let t = 0; t < tokenArray.length; t++) {
 		const tokenId = tokenArray[t];
 		const requiredAmt = tokenQtyMap.get(tokenId);
-		const ownedAmt = tokenBalancesMaps.get(tokenId).get(senderAccountId);
+		const ownedAmt = ownedTokenMap.get(tokenId);
 		if (requiredAmt > ownedAmt) {
 			console.log(`[INFO]: Sending ${requiredAmt} / owned ${ownedAmt} -> **FAILED**`);
 			enoughTokens = false;
@@ -456,11 +457,17 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 				// sign
 				const signedTx = await tokenTransferTx.sign(myPrivateKey);
 				// submit
-				const tokenTransferSubmit = await signedTx.execute(client);
-				// check it worked
-				const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-				if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString());
-				if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
+				try {
+					const tokenTransferSubmit = await signedTx.execute(client);
+					// check it worked
+					const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
+					console.log('Tx processed - status:', tokenTransferRx.status.toString());
+					if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
+				}
+				catch (err) {
+					console.log('Error occured executing tx:', err);
+					txStatus = false;
+				}
 			}
 			tfr.success = txStatus;
 		}
@@ -473,70 +480,88 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	nftBatchSize = 9;
 	// not wrapped in try/catch as not recoverable anyway.
 	for (let outer = 0; outer < fungibleTokenTfr.length; outer += nftBatchSize) {
-		const tokenTransferTx = new TransferTransaction();
-
+		let tokenTransferTx = new TransferTransaction();
+		let decimals;
 		let pmtSum = 0;
 		let lastToken = '';
 		let txBeingProcessedIndex = [];
 		let txStatus = true;
 		for (let inner = 0; (inner < nftBatchSize) && ((outer + inner) < fungibleTokenTfr.length); inner++) {
 			const tfr = fungibleTokenTfr[outer + inner];
-			txBeingProcessedIndex.push(tfr);
 			if (tfr instanceof Transaction) {
 				const tokenToSend = tfr.tokenId;
+				decimals = tokenDecimalsMap.get(tokenToSend);
+				if (verbose) console.log(`using decimals ${decimals} for token ${tokenToSend}`);
 				if (tokenToSend != lastToken) {
 					if (pmtSum > 0) {
 						// we need to process existing txs
-						if (verbose) console.log(`Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
-						tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum);
+						if (verbose) console.log(`(token shift) Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
+						tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
 						if (verbose) console.log('Processing transfer');
 						tokenTransferTx
-							.addTokenTransfer(lastToken, senderAccountId, -pmtSum)
 							.setTransactionMemo(memo)
 							.freezeWith(client);
 						// sign
 						const signedTx = await tokenTransferTx.sign(myPrivateKey);
 						// submit
-						const tokenTransferSubmit = await signedTx.execute(client);
-						// check it worked
-						const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-						if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString);
-						if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
+						try {
+							const tokenTransferSubmit = await signedTx.execute(client);
+							// check it worked
+							const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
+							const rxStatus = tokenTransferRx.status.toString();
+							console.log('Tx processed - status:', rxStatus);
+							if (rxStatus != 'SUCCESS') txStatus = false;
+						}
+						catch (err) {
+							console.log('Error occured executing tx:', err);
+							txStatus = false;
+						}
 
 						for (let t = 0; t < txBeingProcessedIndex.length; t++) {
-							fungibleTokenTfr[txBeingProcessedIndex[t]].status = txStatus;
+							fungibleTokenTfr[txBeingProcessedIndex[t]].success = txStatus;
 						}
 					}
 					pmtSum = 0;
 					lastToken = tokenToSend;
 					txBeingProcessedIndex = [];
+					tokenTransferTx = new TransferTransaction();
+					txStatus = true;
 				}
 				const pmt = Number(tfr.quantity);
 				pmtSum += pmt;
-				tokenTransferTx.addTokenTransfer(tfr.tokenId, tfr.receiverWallet, tfr.quantity);
+				tokenTransferTx.addTokenTransfer(tfr.tokenId, tfr.receiverWallet, tfr.quantity * (10 ** decimals));
+				if (verbose) {
+					console.log(`..adding transfer for ${tfr.quantity} of ${tfr.tokenId} to ${tfr.receiverWallet}.\t-> running total: ${pmtSum}`);
+				}
 				txBeingProcessedIndex.push((outer + inner));
 			}
 		}
 
 		if (verbose) console.log(`Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
-		tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum);
+		tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
 		if (verbose) console.log('Processing transfer');
 
 		tokenTransferTx
-			.addTokenTransfer(lastToken, senderAccountId, -pmtSum)
 			.setTransactionMemo(memo)
 			.freezeWith(client);
 		// sign
 		const signedTx = await tokenTransferTx.sign(myPrivateKey);
 		// submit
-		const tokenTransferSubmit = await signedTx.execute(client);
-		// check it worked
-		const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-		if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString());
-		if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
+		try {
+			const tokenTransferSubmit = await signedTx.execute(client);
+			// check it worked
+			const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
+			const rxStatus = tokenTransferRx.status.toString();
+			console.log('Tx processed - status:', rxStatus);
+			if (rxStatus != 'SUCCESS') txStatus = false;
+		}
+		catch (err) {
+			console.log('Error occured executing tx:', err);
+			txStatus = false;
+		}
 
 		for (let t = 0; t < txBeingProcessedIndex.length; t++) {
-			fungibleTokenTfr[txBeingProcessedIndex[t]].status = txStatus;
+			fungibleTokenTfr[txBeingProcessedIndex[t]].success = txStatus;
 		}
 	}
 
