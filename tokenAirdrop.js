@@ -112,7 +112,7 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 					console.log(`wallet (${receiverWallet} had ${quantity} in file, sending ${remCapacity} instead due to MAX_TRANSFER (${maxTferAmt}) limit`);
 					amt += remCapacity;
 					const tx = new Transaction(receiverWallet, tokenId, remCapacity, serialArray, `MAX TRANSFER LIMIT: Quantity reduced by ${quantity - remCapacity}`, false);
-					skippedTfrs.push(tx);
+					tokenTransfers.push(tx);
 				}
 				else {
 					console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** instead due to MAX_TRANSFER (${maxTferAmt}) limit`);
@@ -143,20 +143,19 @@ function writeDB(tokenTransfers, skippedTxs, filename) {
 		for (let t = 0 ; t < tokenTransfers.length; t++) {
 			const tfr = tokenTransfers[t];
 			if (tfr instanceof Transaction) {
-				const complete = tfr.success;
-				if (complete) {
-					outputStr += `##SUCESS##${tfr.toString}\n`;
+				if (tfr.success) {
+					outputStr += `##SUCESS##${tfr.toString()}\n`;
 				}
 				else {
-					outputStr += `**FAILED**${tfr.toString}\n`;
+					outputStr += `**FAILED**${tfr.toString()}\n`;
 				}
 			}
 		}
 		// add skipped lines
 		for (let s = 0; s < skippedTxs.length; s++) {
-			const tfr = tokenTransfers[s];
+			const tfr = skippedTxs[s];
 			if (tfr instanceof Transaction) {
-				outputStr += `!!SKIPPED!!${tfr.toString}\n`;
+				outputStr += `!!SKIPPED!!${tfr.toString()}\n`;
 			}
 		}
 		fs.writeFile('output' + filename, outputStr, () => {
@@ -313,7 +312,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 						const indexOfSerial = serialsOwned.indexOf(serial);
 						if (indexOfSerial < 0) {
 							console.log(`[ERROR]: sender (${senderAccountId}) does not own serial (${serial}) of token (${tokenId}) specified to send to ${tfr.receiverWallet}`);
-							tfr.message = tfr.message + `ERROR: requested to send a serial not owned ${tokenId} / #${serial} `;
+							tfr.message += `ERROR: requested to send a serial not owned ${tokenId} / #${serial} `;
 							skippedTfr.push(tfr);
 							serialCheckPassed = false;
 						}
@@ -446,7 +445,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 				for (let inner = 0; (inner < nftBatchSize) && ((outer + inner) < serialsList.length); inner++) {
 					const serial = serialsList[outer + inner];
 					tokenTransferTx.addNftTransfer(tfr.tokenId, serial, senderAccountId, tfr.receiverWallet);
-					if (verbose) console.log(`Adding ${serial} of ${tfr.tokenId} to tx to send to ${tfr.receiverWallet} from ${senderAccountId}`);
+					if (verbose) console.log(`Adding serial ${serial} of ${tfr.tokenId} to tx to send to ${tfr.receiverWallet} from ${senderAccountId}`);
 				}
 				// assumes the account sending is treasury account
 				if (verbose) console.log('Sending NFT(s)');
@@ -460,8 +459,8 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 				const tokenTransferSubmit = await signedTx.execute(client);
 				// check it worked
 				const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-				if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString);
-				if (tokenTransferRx.status.toString != 'SUCCESS') txStatus = false;
+				if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString());
+				if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
 			}
 			tfr.success = txStatus;
 		}
@@ -502,7 +501,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 						// check it worked
 						const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
 						if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString);
-						if (tokenTransferRx.status.toString != 'SUCCESS') txStatus = false;
+						if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
 
 						for (let t = 0; t < txBeingProcessedIndex.length; t++) {
 							fungibleTokenTfr[txBeingProcessedIndex[t]].status = txStatus;
@@ -533,8 +532,8 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 		const tokenTransferSubmit = await signedTx.execute(client);
 		// check it worked
 		const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-		if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString);
-		if (tokenTransferRx.status.toString != 'SUCCESS') txStatus = false;
+		if (verbose) console.log('Tx processed - status:', tokenTransferRx.status.toString());
+		if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
 
 		for (let t = 0; t < txBeingProcessedIndex.length; t++) {
 			fungibleTokenTfr[txBeingProcessedIndex[t]].status = txStatus;
@@ -546,7 +545,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 
 	// this will reorder the lines -- if user feedback request could maintain ordering
 	// concat to an empty array to be sure we always pass back something.
-	return [].concat(nftTokenTfr, fungibleTokenTfr);
+	return [[...nftTokenTfr, ...fungibleTokenTfr], skippedTfr];
 }
 
 async function getTokenBalanceMap(tokenId) {
@@ -766,8 +765,13 @@ async function main() {
 
 	if (processFlag) {
 		// process the payment file
-		processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test).then(tfrMap => {
-			writeDB(tfrMap, skippedTfrs, processFile);
+		processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test).then(([processedTfrs, moreSkippedTfrs]) => {
+			const allSkippedTfrs = [...skippedTfrs, ...moreSkippedTfrs];
+			if (verbose) {
+				console.log('Processed tx:', processedTfrs);
+				console.log('Skipped tx:', allSkippedTfrs);
+			}
+			writeDB(processedTfrs, allSkippedTfrs, processFile);
 		});
 	}
 }
