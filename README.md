@@ -2,6 +2,8 @@
 
 Designed to read in a file for processing
 
+**instructions for running towards the bottom**
+
 file format (headers):
 ## destWallet,tokenToSend,quantity,serial
 
@@ -32,10 +34,38 @@ If sending Fungible Common tokens that all instructions for a given token will b
 
 -------
 
-#setup your.env file [sending wallet / PK / any limit on sending / memo ]
+**setup your.env file [sending wallet / PK / any limit on sending / memo ]**
 
 node tokenAirdrop.js -process <filename>
   -> send out the airdrop 
 
 node tokenAirdrop.js -process <filename> -test
   -> run the process without sending any tokens.
+
+**in more narrative format**
+
+you will need a .env file - can create or rename .env.example - i recommend the following settings (replacing your account/key of course 
+
+ENVIRONMENT=MAIN
+MY_ACCOUNT_ID=0.0.222
+MY_PRIVATE_KEY=302asbbdskbfjhfskhkds
+MAX_TRANSFER=
+MEMO='Airdrop'
+EXCLUDE_WALLETS=
+EXCLUDE_SERIALS=
+
+
+then create a file to drive the airdrop - call it whatever you like (you do not need the header but included for easier reference):
+## destWallet,tokenToSend,quantity,serial
+0.0.1111,0.0.1042640,5,*****
+0.0.11111,0.0.1042695,5,*****
+0.0.111111,0.0.1042726,1,0
+
+
+replace *'s with a comma separated list of serials e.g. 1,3,6,10,15 (enough to match the quantity) or a 0 and it will pick them randomly.
+
+then you can run from terminal:
+
+node tokenAirdrop.js -process <filename> -test
+
+filename being the name of the above instruction file you saved
