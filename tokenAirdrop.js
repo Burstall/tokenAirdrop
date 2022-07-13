@@ -580,6 +580,7 @@ async function getTokenBalanceMap(tokenId) {
 	const tokenBalMap = new Map();
 	try {
 		do {
+			if (verbose) console.log(baseUrl + routeUrl);
 			const json = await fetchJson(baseUrl + routeUrl);
 			if (json == null) {
 				console.log('FATAL ERROR: no NFTs found', baseUrl + routeUrl);
@@ -598,7 +599,7 @@ async function getTokenBalanceMap(tokenId) {
 			routeUrl = json.links.next;
 		}
 		while (routeUrl);
-
+		if (verbose) console.log(tokenBalMap);
 		return tokenBalMap;
 	}
 	catch (err) {
@@ -722,6 +723,9 @@ async function main() {
 		return;
 	}
 
+	console.log('Using ENIVRONMENT:', env);
+	console.log('Using MEMO:', memo);
+
 	verbose = getArgFlag('v');
 
 	const processFlag = getArgFlag('process');
@@ -744,8 +748,10 @@ async function main() {
 		// swallow the error and assume no limit
 		maxTferAmt = null;
 	}
+	console.log('Using MAX_TRANSFER:', maxTferAmt);
 
 	const excludeWalletsEnv = process.env.EXCLUDE_WALLETS;
+	console.log('Using EXCLUDE WALLETS:', excludeWalletsEnv);
 	let excludeWalletsList = [];
 	if (excludeWalletsEnv !== undefined) {
 		excludeWalletsList = [].concat(excludeWalletsEnv.split(','));
@@ -755,6 +761,7 @@ async function main() {
 	const [tfrArray, skippedTfrs, tokenBalancesMaps] = await readDB(processFile, maxTferAmt, excludeWalletsList) ?? [[], [], new Map()];
 
 	const excludeSerialsEnv = process.env.EXCLUDE_SERIALS || null;
+	console.log('Using EXCLUDE_SERIALS:', excludeSerialsEnv);
 	const excludeSerialsList = [];
 	try {
 		if (excludeSerialsEnv === undefined || excludeSerialsEnv == null || excludeSerialsEnv == '') {
