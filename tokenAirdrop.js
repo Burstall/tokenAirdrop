@@ -37,6 +37,8 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 	const userAmtMap = new Map();
 	const tokenBalancesMaps = new Map();
 
+	let lineNum = 0;
+
 	try {
 		try {
 			fs.access(fileToProcess, fs.constants.F_OK, (err) => {
@@ -69,8 +71,6 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 			});
 		}
 
-
-		let lineNum = 0;
 
 		const allFileContents = fs.readFileSync(fileToProcess, 'utf-8');
 		const lines = allFileContents.split(/\r?\n/);
@@ -131,7 +131,7 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 		return [tokenTransfers, skippedTfrs, tokenBalancesMaps];
 	}
 	catch (err) {
-		console.log('ERROR: Could not read DB', err);
+		console.log('ERROR: Could not read DB - error on line:', lineNum, err);
 		// hard abort to avoid duplicate results
 		exit(1);
 	}
