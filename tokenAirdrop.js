@@ -107,6 +107,11 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'NOT ASSOCIATED: **SKIPPED**', false);
 				skippedTfrs.push(tx);
 			}
+			else if (quantity == 0) {
+				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as no tokens instructed to be sent`);
+				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'ZERO Quantity **SKIPPED**', false);
+				skippedTfrs.push(tx);
+			}
 			else if (maxTferAmt != null && ((amt + quantity) > maxTferAmt)) {
 				const remCapacity = maxTferAmt - amt;
 				if (remCapacity > 0) {
