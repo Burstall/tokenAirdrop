@@ -173,12 +173,11 @@ function writeDB(tokenTransfers, skippedTxs, filename) {
 				outputStr += `!!SKIPPED!!${tfr.toString()}\n`;
 			}
 		}
-		let saveFilename = 'output' + filename.replace(/^\.\\/,'');
+		const saveFilename = 'output' + filename.replace(/^\.\\/, '');
 		fs.writeFile(saveFilename, outputStr, { flag: 'w' }, function(err) {
-			if (err) 
-				return console.error(err); 
-			// read it back in to be sure it worked. 
-			fs.readFile(saveFilename, 'utf-8', function (err, data) {
+			if (err) {return console.error(err);}
+			// read it back in to be sure it worked.
+			fs.readFile(saveFilename, 'utf-8', function(err, data) {
 				if (err) {
 					console.log(outputStr);
 					return console.error(err);
