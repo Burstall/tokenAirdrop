@@ -2,6 +2,8 @@
 
 Designed to read in a file for processing
 
+**now supports a token id of 'hbar' to send hbar via airdrop**
+
 **instructions for running towards the bottom**
 
 file format (headers):
@@ -15,6 +17,7 @@ for example
 0.0.XXXX,0.0.YYYYY,1,0  -> send any random NFT owned
 0.0.XXXX,0.0.YYYYY,1,3  -> send user serial 3 (if owned else error message / skip)
 0.0.XXXX,0.0.ZZZZZ,1	-> send user 1 FC token
+0.0.XXXX,hbar,2.25,0	-> send user 2.25 hbar
 
 **ASSUMPTIONS**
 The sending account is treasury account (or there are no royalties - specifically a fall back fee) so there is no need for the receiving party to sign.
@@ -24,7 +27,7 @@ If sending Fungible Common tokens that all instructions for a given token will b
 **Script will**:
  * read in the file
  * check the quantity to send is not more than MAX_TRANSFER tokens [quantity will be adjusted down (floor 0) if possible] -- check across lines (dupes)
- * check the token type [NFT/FC]
+ * check the token type [NFT/FC/HBAR]
  * check the destination address has the token associated
  * upon validation of the line store the pending transaction
  * continue until input file processed
@@ -60,6 +63,7 @@ then create a file to drive the airdrop - call it whatever you like (you do not 
 0.0.1111,0.0.1042640,5,*****
 0.0.11111,0.0.1042695,5,*****
 0.0.111111,0.0.1042726,1,0
+0.0.111,hbar,2.2,0
 
 
 replace *'s with a comma separated list of serials e.g. 1,3,6,10,15 (enough to match the quantity) or a 0 and it will pick them randomly.

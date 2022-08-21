@@ -2,6 +2,8 @@ import {
 	PrivateKey,
 	Client,
 	TransferTransaction,
+	Hbar,
+	HbarUnit,
 } from '@hashgraph/sdk';
 import 'dotenv/config';
 import * as fs from 'fs';
@@ -87,14 +89,21 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 			const quantity = Number(qty);
 			const serialArray = rest.length == 0 ? [0] : rest;
 
-			let tokenBalMap = tokenBalancesMaps.get(tokenId) || null;
-			if (tokenBalMap == null) {
-				if (verbose) console.log('Building token/balance map for', tokenId);
-				tokenBalMap = await getTokenBalanceMap(tokenId);
-				tokenBalancesMaps.set(tokenId, tokenBalMap);
-			}
+			let tokenBalMap;
+			let walletAssociated;
+			if (tokenId.toLowerCase() != 'hbar') {
+				tokenBalMap = tokenBalancesMaps.get(tokenId) || null;
+				if (tokenBalMap == null) {
+					if (verbose) console.log('Building token/balance map for', tokenId);
+					tokenBalMap = await getTokenBalanceMap(tokenId);
+					tokenBalancesMaps.set(tokenId, tokenBalMap);
+				}
 
-			const walletAssociated = tokenBalMap.get(receiverWallet) >= 0 ? true : false;
+				walletAssociated = tokenBalMap.get(receiverWallet) >= 0 ? true : false;
+			}
+			else {
+				walletAssociated = true;
+			}
 
 			let amt = userAmtMap.get(receiverWallet) || 0;
 			if (excludeWalletsList.includes(receiverWallet)) {
@@ -235,6 +244,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	// split the transfer types -- recombine to return them.
 	const nftTokenTfr = [];
 	const fungibleTokenTfr = [];
+	const hbarTfr = [];
 
 	// create array for skipped in pre-flight check
 	const skippedTfr = [];
@@ -256,36 +266,46 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	for (let t = 0; t < tfrArray.length; t++) {
 		const tfr = tfrArray[t];
 		if (tfr instanceof Transaction) {
-			const tokenId = tfr.tokenId;
+			const tokenId = tfr.tokenId.toLowerCase();
 			let tokenType = tokenTypeMap.get(tokenId) || null;
 			let decimals = 0;
 
+
 			// if tokenType is null then we have not processed this token yet so build the details
 			if (tokenType == null) {
-				[tokenType, decimals] = await getTokenType(tokenId);
-				tokenTypeMap.set(tokenId, tokenType);
-				tokenDecimalsMap.set(tokenId, decimals);
-				tokenArray.push(tokenId);
-
-				const tknBalMap = tokenBalancesMaps.get(tokenId);
-				const bal = tknBalMap.get(senderAccountId) || 0;
-				ownedTokenMap.set(tokenId, bal);
-
-				// fetch the serial list if an NFT
-				if (tokenType == 'NON_FUNGIBLE_UNIQUE') {
-					// time to get serials owned
-					const serialsOwned = await getSerialsOwned(tokenId, senderAccountId, excludeSerialsList);
-					serialsOwnedMap.set(tokenId, serialsOwned);
-				}
-				else if (tokenType == 'FUNGIBLE_COMMON') {
-					// adjust for the decimals
-					const balDecimalAdjusted = bal * (10 ** -decimals);
-					ownedTokenMap.set(tokenId, balDecimalAdjusted);
+				if (tokenId == 'hbar') {
+					tokenType = 'HBAR';
+					tokenTypeMap.set(tokenId, tokenType);
+					const hbarBal = await getHbarBalance(senderAccountId);
+					ownedTokenMap.set(tokenId, hbarBal);
+					tokenArray.push(tokenId);
 				}
 				else {
-					// catch-all suggests we have an error
-					console.log('[ERROR]: please check the token specified -- looks like it is not a token (maybe a wallet):', tokenId);
-					errorTokenIds.push(tokenId);
+					[tokenType, decimals] = await getTokenType(tokenId);
+					tokenTypeMap.set(tokenId, tokenType);
+					tokenDecimalsMap.set(tokenId, decimals);
+					tokenArray.push(tokenId);
+
+					const tknBalMap = tokenBalancesMaps.get(tokenId);
+					const bal = tknBalMap.get(senderAccountId) || 0;
+					ownedTokenMap.set(tokenId, bal);
+
+					// fetch the serial list if an NFT
+					if (tokenType == 'NON_FUNGIBLE_UNIQUE') {
+						// time to get serials owned
+						const serialsOwned = await getSerialsOwned(tokenId, senderAccountId, excludeSerialsList);
+						serialsOwnedMap.set(tokenId, serialsOwned);
+					}
+					else if (tokenType == 'FUNGIBLE_COMMON') {
+						// adjust for the decimals
+						const balDecimalAdjusted = bal * (10 ** -decimals);
+						ownedTokenMap.set(tokenId, balDecimalAdjusted);
+					}
+					else {
+						// catch-all suggests we have an error
+						console.log('[ERROR]: please check the token specified -- looks like it is not a token (maybe a wallet):', tokenId);
+						errorTokenIds.push(tokenId);
+					}
 				}
 			}
 
@@ -330,6 +350,9 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 				}
 				if (serialCheckPassed) nftTokenTfr.push(tfr);
 			}
+			else if (tokenType == 'HBAR') {
+				hbarTfr.push(tfr);
+			}
 			else {
 				fungibleTokenTfr.push(tfr);
 			}
@@ -347,11 +370,11 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 		const requiredAmt = tokenQtyMap.get(tokenId);
 		const ownedAmt = ownedTokenMap.get(tokenId);
 		if (requiredAmt > ownedAmt) {
-			console.log(`[INFO]: Sending ${requiredAmt} / owned ${ownedAmt} -> **FAILED**`);
+			console.log(`[INFO]: ${tokenId} -> Sending ${requiredAmt} / owned ${ownedAmt} -> **FAILED**`);
 			enoughTokens = false;
 		}
 		else {
-			console.log(`[INFO]: Sending ${requiredAmt} / owned ${ownedAmt} -> PASSED`);
+			console.log(`[INFO]: ${tokenId} -> Sending ${requiredAmt} / owned ${ownedAmt} -> PASSED`);
 		}
 	}
 
@@ -569,13 +592,61 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 			fungibleTokenTfr[txBeingProcessedIndex[t]].success = txStatus;
 		}
 	}
+	// now process hbar transfers
+	// not wrapped in try/catch as not recoverable anyway.
+
+	for (let outer = 0; outer < hbarTfr.length; outer += nftBatchSize) {
+		const tokenTransferTx = new TransferTransaction();
+		let pmtSum = 0;
+		const txBeingProcessedIndex = [];
+		let txStatus = true;
+		for (let inner = 0; (inner < nftBatchSize) && ((outer + inner) < hbarTfr.length); inner++) {
+			const tfr = hbarTfr[outer + inner];
+			if (tfr instanceof Transaction) {
+				const pmt = Number(tfr.quantity);
+				pmtSum = Math.round((pmtSum + pmt) * 1e8) / 1e8;
+				tokenTransferTx.addHbarTransfer(tfr.receiverWallet, new Hbar(tfr.quantity, HbarUnit.Hbar));
+				if (verbose) {
+					console.log(`..adding transfer for ${tfr.quantity} of ${tfr.tokenId} to ${tfr.receiverWallet}.\t-> running total: ${pmtSum}`);
+				}
+				txBeingProcessedIndex.push((outer + inner));
+			}
+		}
+
+		if (verbose) console.log(`Adding treasury debit of ${-pmtSum} HBAR from ${senderAccountId}`);
+		tokenTransferTx.addHbarTransfer(senderAccountId, new Hbar(-pmtSum, HbarUnit.Hbar));
+		if (verbose) console.log('Processing transfer');
+
+		tokenTransferTx
+			.setTransactionMemo(memo)
+			.freezeWith(client);
+		// sign
+		const signedTx = await tokenTransferTx.sign(myPrivateKey);
+		// submit
+		try {
+			const tokenTransferSubmit = await signedTx.execute(client);
+			// check it worked
+			const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
+			const rxStatus = tokenTransferRx.status.toString();
+			console.log('Tx processed - status:', rxStatus);
+			if (rxStatus != 'SUCCESS') txStatus = false;
+		}
+		catch (err) {
+			console.log('Error occured executing tx:', err);
+			txStatus = false;
+		}
+
+		for (let t = 0; t < txBeingProcessedIndex.length; t++) {
+			hbarTfr[txBeingProcessedIndex[t]].success = txStatus;
+		}
+	}
 
 	// TODO keep a log of user tokens before and after to check it worked
 	// subject to mirror node refresh speed...
 
 	// this will reorder the lines -- if user feedback request could maintain ordering
 	// concat to an empty array to be sure we always pass back something.
-	return [[...nftTokenTfr, ...fungibleTokenTfr], skippedTfr];
+	return [[...nftTokenTfr, ...fungibleTokenTfr, ...hbarTfr], skippedTfr];
 }
 
 async function getTokenBalanceMap(tokenId) {
@@ -644,6 +715,17 @@ async function getSerialsOwned(tokenId, wallet, excludeSerialsList = []) {
 		console.error(err);
 		exit(1);
 	}
+}
+
+async function getHbarBalance(accountId) {
+	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
+	const routeUrl = `/api/v1/accounts/${accountId}/`;
+
+	const accountJSON = await fetchJson(baseUrl + routeUrl);
+
+	const acctBalance = accountJSON.balance.balance * 10 ** -8;
+
+	return acctBalance;
 }
 
 async function getTokenType(tokenId) {
