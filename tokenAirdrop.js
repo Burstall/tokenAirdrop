@@ -360,9 +360,11 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 				if (serialCheckPassed) nftTokenTfr.push(tfr);
 			}
 			else if (tokenType == 'HBAR') {
+				tfr.setSerials([0]);
 				hbarTfr.push(tfr);
 			}
 			else {
+				tfr.setSerials([0]);
 				fungibleTokenTfr.push(tfr);
 			}
 
