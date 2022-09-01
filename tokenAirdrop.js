@@ -108,17 +108,17 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 			let amt = userAmtMap.get(receiverWallet) || 0;
 			if (excludeWalletsList.includes(receiverWallet)) {
 				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as wallet in exclude list`);
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'EXCLUDED WALLET: **SKIPPED**', false);
+				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'EXCLUDED WALLET: **SKIPPED**', false, false);
 				skippedTfrs.push(tx);
 			}
 			else if (!walletAssociated) {
 				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as wallet has not associated the token`);
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'NOT ASSOCIATED: **SKIPPED**', false);
+				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'NOT ASSOCIATED: **SKIPPED**', false, false);
 				skippedTfrs.push(tx);
 			}
 			else if (quantity == 0) {
 				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as no tokens instructed to be sent`);
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'ZERO Quantity **SKIPPED**', false);
+				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'ZERO Quantity **SKIPPED**', false, false);
 				skippedTfrs.push(tx);
 			}
 			else if (maxTferAmt != null && ((amt + quantity) > maxTferAmt)) {
@@ -131,7 +131,7 @@ async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
 				}
 				else {
 					console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** instead due to MAX_TRANSFER (${maxTferAmt}) limit`);
-					const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'MAX TRANSFER LIMIT: **SKIPPED**', false);
+					const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'MAX TRANSFER LIMIT: **SKIPPED**', false, false);
 					skippedTfrs.push(tx);
 				}
 			}
@@ -193,7 +193,7 @@ function writeDB(tokenTransfers, skippedTxs, filename) {
 
 // create an object to simplify rather thn passing arrays around
 class Transaction {
-	constructor(recieverWallet, tokenId, quantity, serialArray, msg, success) {
+	constructor(recieverWallet, tokenId, quantity, serialArray, msg, success, allocateSerials = true) {
 		this.receiverWallet = recieverWallet;
 		this.tokenId = tokenId;
 		this.quantity = quantity;
@@ -205,8 +205,10 @@ class Transaction {
 		}
 
 		// ensure serial array is as long as the qty
-		while (this.serialArray.length < this.quantity) {
-			this.serialArray.push(0);
+		if (allocateSerials) {
+			while (this.serialArray.length < this.quantity) {
+				this.serialArray.push(0);
+			}
 		}
 		this.message = msg;
 		this.success = success;
@@ -234,7 +236,7 @@ class Transaction {
 	}
 }
 
-async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test) {
+async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test, sendFTlineByLine = false) {
 
 	if (tfrArray.length == 0) {
 		console.log('No transfers sent for processing - BUGGING OUT');
@@ -516,7 +518,13 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	// ASSUMPTION: the token being sent is likely grouped so try and complete maximum tx in each batch (unles token changes)
 
 	// update batch size to be 9 account and 1 -ve tx to debit treasury.
-	nftBatchSize = 9;
+	if (sendFTlineByLine) {
+		nftBatchSize = 1;
+		console.log('User request to send FTs on a per line basis');
+	}
+	else {
+		nftBatchSize = 9;
+	}
 	// not wrapped in try/catch as not recoverable anyway.
 	for (let outer = 0; outer < fungibleTokenTfr.length; outer += nftBatchSize) {
 		let tokenTransferTx = new TransferTransaction();
@@ -605,7 +613,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	}
 	// now process hbar transfers
 	// not wrapped in try/catch as not recoverable anyway.
-
+	nftBatchSize = 9;
 	for (let outer = 0; outer < hbarTfr.length; outer += nftBatchSize) {
 		const tokenTransferTx = new TransferTransaction();
 		let pmtSum = 0;
@@ -817,6 +825,9 @@ async function main() {
 		console.log('Usage: node tokenAirdrop.js -process <file> [-test] [-v]');
 		console.log('       -process <file>		the tokens to send');
 		console.log('       -test				process the file but nothign sent');
+		console.log('       -byline				force FTs to send line by line');
+		console.log('       	useful for when batches fail due to account with the token frozen');
+		console.log('       	only impacts FT transfers not NFT/hbar');
 		console.log('       -v          		verbose [debug]');
 		return;
 	}
@@ -828,6 +839,8 @@ async function main() {
 
 	const processFlag = getArgFlag('process');
 	const processFile = getArg('process');
+
+	const sendFTlineByLine = getArgFlag('byline');
 
 	const test = getArgFlag('test');
 
@@ -895,7 +908,7 @@ async function main() {
 
 	if (processFlag) {
 		// process the payment file
-		processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test).then(([processedTfrs, moreSkippedTfrs]) => {
+		processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test, sendFTlineByLine).then(([processedTfrs, moreSkippedTfrs]) => {
 			const allSkippedTfrs = [...skippedTfrs, ...moreSkippedTfrs];
 			if (verbose) {
 				console.log('Processed tx:', processedTfrs);
