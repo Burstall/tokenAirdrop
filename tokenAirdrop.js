@@ -4,6 +4,8 @@ import {
 	TransferTransaction,
 	Hbar,
 	HbarUnit,
+	AccountId,
+	TransactionId,
 } from '@hashgraph/sdk';
 import 'dotenv/config';
 import * as fs from 'fs';
@@ -18,6 +20,7 @@ const env = process.env.ENVIRONMENT ?? null;
 const dbHeaders = '#destWallet,tokenToSend,quantity,serial\n';
 const baseUrlForMainnet = 'https://mainnet-public.mirrornode.hedera.com';
 const baseUrlForTestnet = 'http://testnet.mirrornode.hedera.com';
+let isApproval, approvalAcct;
 
 /*
 Read in the flat file Database
@@ -391,7 +394,10 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 		}
 	}
 
-	if (!enoughTokens) {
+	if (isApproval) {
+		console.log('Overiding the balance check as using approval spending');
+	}
+	else if (!enoughTokens) {
 		console.log('Not enough tokens to meet the requested distribution - exiting');
 		exit(1);
 	}
@@ -478,6 +484,10 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	// process easch instruction seperately to ensure success/failure lines up (less efficient of course).
 	// more important for NFTs given unique...FT can aggregate.
 	for (let n = 0; n < nftTokenTfr.length; n++) {
+		if (isApproval) {
+			console.log('Untested for using allowance spend on NFTs for airdrop - exiting');
+			process.exit(1);
+		}
 		const tfr = nftTokenTfr[n];
 		let txStatus = true;
 		if (tfr instanceof Transaction) {
@@ -515,7 +525,7 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 	}
 
 	// will be rare to send a list of different FC tokens in a single batch
-	// ASSUMPTION: the token being sent is likely grouped so try and complete maximum tx in each batch (unles token changes)
+	// ASSUMPTION: the token being sent is likely grouped so try and complete maximum tx in each batch (unless token changes)
 
 	// update batch size to be 9 account and 1 -ve tx to debit treasury.
 	if (sendFTlineByLine) {
@@ -543,7 +553,14 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 					if (pmtSum > 0) {
 						// we need to process existing txs
 						if (verbose) console.log(`(token shift) Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
-						tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
+						if (isApproval) {
+							tokenTransferTx
+								.addApprovedTokenTransfer(lastToken, approvalAcct, -pmtSum * (10 ** decimals))
+								.setTransactionId(TransactionId.generate(senderAccountId));
+						}
+						else {
+							tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
+						}
 						if (verbose) console.log('Processing transfer');
 						tokenTransferTx
 							.setTransactionMemo(memo)
@@ -585,7 +602,15 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 		}
 
 		if (verbose) console.log(`Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
-		tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
+
+		if (isApproval) {
+			tokenTransferTx
+				.addApprovedTokenTransfer(lastToken, approvalAcct, -pmtSum * (10 ** decimals))
+				.setTransactionId(TransactionId.generate(senderAccountId));
+		}
+		else {
+			tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
+		}
 		if (verbose) console.log('Processing transfer');
 
 		tokenTransferTx
@@ -633,7 +658,14 @@ async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList,
 		}
 
 		if (verbose) console.log(`Adding treasury debit of ${-pmtSum} HBAR from ${senderAccountId}`);
-		tokenTransferTx.addHbarTransfer(senderAccountId, new Hbar(-pmtSum, HbarUnit.Hbar));
+		if (isApproval) {
+			tokenTransferTx
+				.addApprovedHbarTransfer(approvalAcct, new Hbar(-pmtSum, HbarUnit.Hbar))
+				.setTransactionId(TransactionId.generate(senderAccountId));
+		}
+		else {
+			tokenTransferTx.addHbarTransfer(senderAccountId, new Hbar(-pmtSum, HbarUnit.Hbar));
+		}
 		if (verbose) console.log('Processing transfer');
 
 		tokenTransferTx
@@ -828,6 +860,8 @@ async function main() {
 		console.log('       -byline				force FTs to send line by line');
 		console.log('       	useful for when batches fail due to account with the token frozen');
 		console.log('       	only impacts FT transfers not NFT/hbar');
+		console.log('       -approval 0.0.ZZZ	transactions use Allowan on behalf of 0.0.ZZZ');
+		console.log('       	supported for FT / hbar only for now');
 		console.log('       -v          		verbose [debug]');
 		return;
 	}
@@ -836,6 +870,10 @@ async function main() {
 	console.log('Using MEMO:', memo);
 
 	verbose = getArgFlag('v');
+
+	isApproval = getArgFlag('approval');
+	// form as AccountId to fail hard & fast if not in right format
+	if (isApproval) approvalAcct = AccountId.fromString(getArg('approval'));
 
 	const processFlag = getArgFlag('process');
 	const processFile = getArg('process');
