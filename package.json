@@ -15,11 +15,11 @@
   "author": "Stowerling",
   "license": "ISC",
   "dependencies": {
-    "@hashgraph/sdk": "^2.11.3",
+    "@hashgraph/sdk": "^2.22.0",
     "cross-fetch": "^3.1.5",
     "dotenv": "^16.0.0"
   },
   "devDependencies": {
-    "eslint": "^8.17.0"
+    "eslint": "^8.35.0"
   }
 }
