@@ -1,3 +1,10 @@
+/**
+ * Hedera Token Airdrop Script v1.0.0
+ * 
+ * Supports parallel processing, resume capability, and progress tracking
+ * for airdrops of NFTs, Fungible Tokens, and HBAR on Hedera network
+ */
+
 import {
 	PrivateKey,
 	Client,
@@ -9,841 +16,964 @@ import {
 } from '@hashgraph/sdk';
 import 'dotenv/config';
 import * as fs from 'fs';
-
 import fetch from 'cross-fetch';
 import { exit } from 'process';
 
-const maxRetries = 10;
-let verbose = false;
-const memo = process.env.MEMO || 'Airdrop';
-const env = process.env.ENVIRONMENT ?? null;
-const dbHeaders = '#destWallet,tokenToSend,quantity,serial\n';
-const baseUrlForMainnet = 'https://mainnet-public.mirrornode.hedera.com';
-const baseUrlForTestnet = 'http://testnet.mirrornode.hedera.com';
-let isApproval, approvalAcct;
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
-/*
-Read in the flat file Database
-check lines with regex mask to start with wallet else ignore line
-format:
-#destWallet,tokenToSend,quantity,serial
+/**
+ * @typedef {Object} Config
+ * @property {string} network - Network to use (mainnet/testnet/previewnet/custom)
+ * @property {string} mirrorNodeUrl - Mirror node base URL
+ * @property {string} senderAccountId - Account sending tokens
+ * @property {string} privateKey - Private key for sender
+ * @property {number|null} maxTransferPerWallet - Max tokens per wallet
+ * @property {number} maxConcurrentTxs - Max concurrent transactions
+ * @property {string} memo - Transaction memo
+ * @property {string[]} excludeWallets - Wallets to skip
+ * @property {number[]} excludeSerials - NFT serials to exclude
+ * @property {boolean} verbose - Enable verbose logging
+ * @property {boolean} isApproval - Using allowance approval
+ * @property {AccountId|null} approvalAcct - Approval account if applicable
+ */
 
-serial=0 implies send a random NFT owned (excluding any serials in the .env file EXCLUDE_SERIALS variable [a comma seperated list or a range **NEVER BOTH**])
+/**
+ * Build configuration from environment and CLI args
+ * @returns {Config}
+ */
+function buildConfig() {
+	const network = (process.env.NETWORK || 'mainnet').toLowerCase();
 
-for example
-0.0.XXXX,0.0.YYYYY,1,0  -> send any random NFT owned
-0.0.XXXX,0.0.YYYYY,1,3  -> send user serial 3 (if owned else error message / skip)
-0.0.XXXX,0.0.ZZZZZ,1	-> send user 1 FC token
-*/
-async function readDB(fileToProcess, maxTferAmt, excludeWalletsList) {
-	const tokenTransfers = [];
-	const skippedTfrs = [];
-
-	const userAmtMap = new Map();
-	const tokenBalancesMaps = new Map();
-
-	let lineNum = 0;
-
-	try {
-		try {
-			fs.access(fileToProcess, fs.constants.F_OK, (err) => {
-				if (err) {
-					console.log(`${fileToProcess} does not exist - Creating the file`, err);
-					fs.writeFileSync(fileToProcess, dbHeaders);
-
-					// Test the if the file exists again
-					fs.access(fileToProcess, fs.constants.F_OK, (err) => {
-						if (err) {
-						// failed to create hard abort
-							console.log('ERROR: could not read or create the file', err);
-							exit(1);
-						}
-					});
-				}
-			});
+	// Mirror node URL construction
+	let mirrorNodeUrl;
+	if (network === 'custom') {
+		mirrorNodeUrl = process.env.CUSTOM_MIRROR_URL;
+		if (!mirrorNodeUrl) {
+			throw new Error('CUSTOM_MIRROR_URL must be set when NETWORK=custom');
 		}
-		catch (err) {
-			console.log(`${fileToProcess} does not exist - Creating the file`, err);
-			fs.writeFileSync(fileToProcess, dbHeaders);
-
-			// Test the if the file exists again
-			fs.access(fileToProcess, fs.constants.F_OK, (err) => {
-				if (err) {
-					// failed to create hard abort
-					console.log('ERROR: could not read or create the file', err);
-					exit(1);
-				}
-			});
+	} else if (['mainnet', 'testnet', 'previewnet'].includes(network)) {
+		mirrorNodeUrl = `https://${network}.mirrornode.hedera.com`;
+	} else {
+		// Backwards compatibility with old ENVIRONMENT variable
+		const oldEnv = process.env.ENVIRONMENT;
+		if (oldEnv === 'MAIN') {
+			mirrorNodeUrl = 'https://mainnet.mirrornode.hedera.com';
+		} else if (oldEnv === 'TEST') {
+			mirrorNodeUrl = 'https://testnet.mirrornode.hedera.com';
+		} else {
+			throw new Error(`Invalid NETWORK: ${network}. Use mainnet, testnet, previewnet, or custom`);
 		}
-
-
-		const allFileContents = fs.readFileSync(fileToProcess, 'utf-8');
-		const lines = allFileContents.split(/\r?\n/);
-		for (let l = 0; l < lines.length; l++) {
-			const line = lines[l];
-			// discard if headers [i.e. does not start with 0. for wallet ID]
-			// also remove attempts ot pay yourself
-			lineNum++;
-			if (!/^0.0.[1-9][0-9]+,/i.test(line)) {
-				console.log(`DB: Skipping line ${lineNum} - poorly formed wallet address: ${line}`);
-				continue;
-			}
-			const [receiverWallet, tokenId, qty, ...rest] = line.split(',');
-			const quantity = Number(qty);
-			const serialArray = rest.length == 0 ? [0] : rest;
-
-			let tokenBalMap;
-			let walletAssociated;
-			if (tokenId.toLowerCase() != 'hbar') {
-				tokenBalMap = tokenBalancesMaps.get(tokenId) || null;
-				if (tokenBalMap == null) {
-					if (verbose) console.log('Building token/balance map for', tokenId);
-					tokenBalMap = await getTokenBalanceMap(tokenId);
-					tokenBalancesMaps.set(tokenId, tokenBalMap);
-				}
-
-				walletAssociated = tokenBalMap.get(receiverWallet) >= 0 ? true : false;
-			}
-			else {
-				walletAssociated = true;
-			}
-
-			let amt = userAmtMap.get(receiverWallet) || 0;
-			if (excludeWalletsList.includes(receiverWallet)) {
-				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as wallet in exclude list`);
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'EXCLUDED WALLET: **SKIPPED**', false, false);
-				skippedTfrs.push(tx);
-			}
-			else if (!walletAssociated) {
-				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as wallet has not associated the token`);
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'NOT ASSOCIATED: **SKIPPED**', false, false);
-				skippedTfrs.push(tx);
-			}
-			else if (quantity == 0) {
-				console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** as no tokens instructed to be sent`);
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'ZERO Quantity **SKIPPED**', false, false);
-				skippedTfrs.push(tx);
-			}
-			else if (maxTferAmt != null && ((amt + quantity) > maxTferAmt)) {
-				const remCapacity = maxTferAmt - amt;
-				if (remCapacity > 0) {
-					console.log(`wallet (${receiverWallet} had ${quantity} in file, sending ${remCapacity} instead due to MAX_TRANSFER (${maxTferAmt}) limit`);
-					amt += remCapacity;
-					const tx = new Transaction(receiverWallet, tokenId, remCapacity, serialArray, `MAX TRANSFER LIMIT: Quantity reduced by ${quantity - remCapacity}`, false);
-					tokenTransfers.push(tx);
-				}
-				else {
-					console.log(`wallet (${receiverWallet} had ${quantity} in file, **SKIPPING** instead due to MAX_TRANSFER (${maxTferAmt}) limit`);
-					const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'MAX TRANSFER LIMIT: **SKIPPED**', false, false);
-					skippedTfrs.push(tx);
-				}
-			}
-			else {
-				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, '', false);
-				tokenTransfers.push(tx);
-				amt += quantity;
-			}
-			userAmtMap.set(receiverWallet, amt);
-		}
-		return [tokenTransfers, skippedTfrs, tokenBalancesMaps];
 	}
-	catch (err) {
-		console.log('ERROR: Could not read DB - error on line:', lineNum, err);
-		// hard abort to avoid duplicate results
+
+	const senderAccountId = process.env.MY_ACCOUNT_ID;
+	const privateKey = process.env.MY_PRIVATE_KEY;
+
+	if (!senderAccountId || !privateKey) {
+		throw new Error('MY_ACCOUNT_ID and MY_PRIVATE_KEY must be set in .env');
+	}
+
+	// Parse max transfer
+	let maxTransferPerWallet = null;
+	try {
+		const val = Number(process.env.MAX_TRANSFER);
+		if (val > 0) maxTransferPerWallet = val;
+	} catch (_err) {
+		// Swallow error, no limit
+	}
+
+	// Parse max concurrent txs
+	let maxConcurrentTxs = 50;
+	try {
+		const val = Number(process.env.MAX_CONCURRENT_TXS);
+		if (val > 0) maxConcurrentTxs = val;
+	} catch (_err) {
+		// Use default
+	}
+
+	// Parse exclude wallets
+	const excludeWalletsEnv = process.env.EXCLUDE_WALLETS || '';
+	const excludeWallets = excludeWalletsEnv ? excludeWalletsEnv.split(',').map(w => w.trim()) : [];
+
+	// Parse exclude serials
+	const excludeSerialsEnv = process.env.EXCLUDE_SERIALS || '';
+	const excludeSerials = parseExcludeSerials(excludeSerialsEnv);
+
+	// CLI flags
+	const verbose = getArgFlag('v');
+	const isApproval = getArgFlag('approval');
+	const approvalAcct = isApproval ? AccountId.fromString(getArg('approval')) : null;
+
+	return {
+		network,
+		mirrorNodeUrl,
+		senderAccountId,
+		privateKey,
+		maxTransferPerWallet,
+		maxConcurrentTxs,
+		memo: process.env.MEMO || 'Airdrop',
+		excludeWallets,
+		excludeSerials,
+		verbose,
+		isApproval,
+		approvalAcct,
+	};
+}
+
+/**
+ * Parse exclude serials from string
+ * @param {string} serialsStr - Serials string (csv or range)
+ * @returns {number[]}
+ */
+function parseExcludeSerials(serialsStr) {
+	if (!serialsStr || serialsStr.trim() === '') return [];
+
+	const excludeSerials = [];
+	try {
+		if (serialsStr.includes('-')) {
+			// Range format: 1-100
+			const [start, end] = serialsStr.split('-').map(Number);
+			for (let i = start; i <= end; i++) {
+				excludeSerials.push(i);
+			}
+		} else if (serialsStr.includes(',')) {
+			// CSV format: 1,2,3,4
+			const parts = serialsStr.split(',');
+			for (const part of parts) {
+				const serial = Number(part.trim());
+				if (!isNaN(serial)) excludeSerials.push(serial);
+			}
+		} else {
+			// Single serial
+			const serial = Number(serialsStr);
+			if (!isNaN(serial)) excludeSerials.push(serial);
+		}
+	} catch (err) {
+		console.error('ERROR: Failed to parse EXCLUDE_SERIALS:', serialsStr);
 		exit(1);
 	}
+	return excludeSerials;
 }
 
-function writeDB(tokenTransfers, skippedTxs, filename) {
-	const updateTime = new Date();
-	let outputStr = `##LAST UPDATE = ${updateTime.toISOString()}\n${dbHeaders}`;
-	try {
-		for (let t = 0 ; t < tokenTransfers.length; t++) {
-			const tfr = tokenTransfers[t];
-			if (tfr instanceof Transaction) {
-				if (tfr.success) {
-					outputStr += `##SUCESS##${tfr.toString()}\n`;
-				}
-				else {
-					outputStr += `**FAILED**${tfr.toString()}\n`;
-				}
-			}
-		}
-		// add skipped lines
-		for (let s = 0; s < skippedTxs.length; s++) {
-			const tfr = skippedTxs[s];
-			if (tfr instanceof Transaction) {
-				outputStr += `!!SKIPPED!!${tfr.toString()}\n`;
-			}
-		}
-		const saveFilename = 'output' + filename.replace(/^\.\\/, '');
-		fs.writeFile(saveFilename, outputStr, { flag: 'w' }, function(err) {
-			if (err) {return console.error(err);}
-			// read it back in to be sure it worked.
-			fs.readFile(saveFilename, 'utf-8', function(err, data) {
-				if (err) {
-					console.log(outputStr);
-					return console.error(err);
-				}
-				console.log('Transfers logged to DB file', saveFilename, data);
-			});
-		});
-	}
-	catch (err) {
-		console.log('Error writign the DB file:', err);
-	}
-}
+// ============================================================================
+// TRANSACTION DATA MODEL
+// ============================================================================
 
-// create an object to simplify rather thn passing arrays around
+/**
+ * Represents a single token transfer transaction
+ */
 class Transaction {
-	constructor(recieverWallet, tokenId, quantity, serialArray, msg, success, allocateSerials = true) {
-		this.receiverWallet = recieverWallet;
+	/**
+	 * @param {string} receiverWallet - Destination wallet
+	 * @param {string} tokenId - Token ID or 'hbar'
+	 * @param {number} quantity - Amount to send
+	 * @param {number[]} serialArray - NFT serials (or [0] for FT/hbar)
+	 * @param {string} message - Status/error message
+	 * @param {boolean} success - Whether tx succeeded
+	 * @param {boolean} allocateSerials - Whether to pad serial array
+	 */
+	constructor(receiverWallet, tokenId, quantity, serialArray, message, success, allocateSerials = true) {
+		this.receiverWallet = receiverWallet;
 		this.tokenId = tokenId;
 		this.quantity = quantity;
 		this.serialArray = [];
+
 		const sA = serialArray.slice(0, quantity);
-		// cast to ensure Numbers
-		for (let s = 0; s < sA.length; s++) {
-			this.serialArray.push(Number(sA[s]));
+		for (const s of sA) {
+			this.serialArray.push(Number(s));
 		}
 
-		// ensure serial array is as long as the qty
+		// Ensure serial array matches quantity
 		if (allocateSerials) {
 			while (this.serialArray.length < this.quantity) {
 				this.serialArray.push(0);
 			}
 		}
-		this.message = msg;
+
+		this.message = message;
 		this.success = success;
+		this.txId = null;
+		this.retryCount = 0;
 	}
 
+	/**
+	 * Get serials as comma-separated string
+	 * @returns {string}
+	 */
 	getSerialString() {
-		let serialString = '';
-		for (let s = 0; s < this.serialArray.length; s++) {
-			if (s > 0) {
-				serialString += ',' + this.serialArray[s];
-			}
-			else {
-				serialString += this.serialArray[s];
-			}
-		}
-		return serialString;
+		return this.serialArray.join(',');
 	}
 
-	toString() {
-		return `${this.receiverWallet},${this.tokenId},${this.quantity},${this.serialArray},${this.message}`;
+	/**
+	 * Convert to CSV row format
+	 * @returns {string}
+	 */
+	toCsvRow() {
+		return `${this.receiverWallet},${this.tokenId},${this.quantity},${this.getSerialString()},${this.message},${this.txId || ''}`;
 	}
 
+	/**
+	 * Update serials array
+	 * @param {number[]} newSerialArray
+	 */
 	setSerials(newSerialArray) {
 		this.serialArray = newSerialArray;
 	}
-}
 
-async function processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test, sendFTlineByLine = false) {
-
-	if (tfrArray.length == 0) {
-		console.log('No transfers sent for processing - BUGGING OUT');
-		exit(1);
-	}
-	// need to know the sender for pre-flight checks
-	const senderAccountId = process.env.MY_ACCOUNT_ID;
-	console.log('[INFO]: Using sender:', senderAccountId);
-
-	// iterate over transfers proposed
-	const tokenTypeMap = new Map();
-	const tokenQtyMap = new Map();
-	const tokenDecimalsMap = new Map();
-	const tokenArray = [];
-
-	// split the transfer types -- recombine to return them.
-	const nftTokenTfr = [];
-	const fungibleTokenTfr = [];
-	const hbarTfr = [];
-
-	// create array for skipped in pre-flight check
-	const skippedTfr = [];
-
-	// Pre-flight checks
-	// check the sender has enough in the account of each token [tokenBalMaps]
-	// check the serials if it is an NFT are owned
-	// check none of the serials are on the exclude list
-	// print each potential tx to console
-	// if test mode then exit.
-	// tokenID vs quantity
-	const ownedTokenMap = new Map();
-	// token vs array of serials owned
-	const serialsOwnedMap = new Map();
-	// keep a list of error token addresses to exclude those txs
-	const errorTokenIds = [];
-
-	// figure out total to send per token ID and the token type.
-	for (let t = 0; t < tfrArray.length; t++) {
-		const tfr = tfrArray[t];
-		if (tfr instanceof Transaction) {
-			const tokenId = tfr.tokenId.toLowerCase();
-			let tokenType = tokenTypeMap.get(tokenId) || null;
-			let decimals = 0;
-
-
-			// if tokenType is null then we have not processed this token yet so build the details
-			if (tokenType == null) {
-				if (tokenId == 'hbar') {
-					tokenType = 'HBAR';
-					tokenTypeMap.set(tokenId, tokenType);
-					const hbarBal = await getHbarBalance(senderAccountId);
-					ownedTokenMap.set(tokenId, hbarBal);
-					tokenArray.push(tokenId);
-				}
-				else {
-					[tokenType, decimals] = await getTokenType(tokenId);
-					tokenTypeMap.set(tokenId, tokenType);
-					tokenDecimalsMap.set(tokenId, decimals);
-					tokenArray.push(tokenId);
-
-					const tknBalMap = tokenBalancesMaps.get(tokenId);
-					const bal = tknBalMap.get(senderAccountId) || 0;
-					ownedTokenMap.set(tokenId, bal);
-
-					// fetch the serial list if an NFT
-					if (tokenType == 'NON_FUNGIBLE_UNIQUE') {
-						// time to get serials owned
-						const serialsOwned = await getSerialsOwned(tokenId, senderAccountId, excludeSerialsList);
-						serialsOwnedMap.set(tokenId, serialsOwned);
-					}
-					else if (tokenType == 'FUNGIBLE_COMMON') {
-						// adjust for the decimals
-						const balDecimalAdjusted = bal * (10 ** -decimals);
-						ownedTokenMap.set(tokenId, balDecimalAdjusted);
-					}
-					else {
-						// catch-all suggests we have an error
-						console.log('[ERROR]: please check the token specified -- looks like it is not a token (maybe a wallet):', tokenId);
-						errorTokenIds.push(tokenId);
-					}
-				}
-			}
-
-			// split tx into FC / NFT given different sending logic
-			// check no serials requested on exclude list
-			// check account owns a given serial
-			if (tokenType == 'NON_FUNGIBLE_UNIQUE') {
-				// check that the serials requested are not on exclude list
-				// else it becomes a skipped tx
-				// N.B. can be a comma seperated list
-				const serialArray = tfr.serialArray;
-				const anyExcludedSerials = serialArray.some(s => excludeSerialsList.includes(s));
-				if (anyExcludedSerials) {
-					// error Tx
-					tfr.message = 'ERROR: requested to send an NFT on the **EXCLUDE** list';
-					skippedTfr.push(tfr);
-					continue;
-				}
-				// now check the sender owns that serial if specified
-				let serialCheckPassed = true;
-				for (let s = 0; s < serialArray.length; s++) {
-					const serial = serialArray[s];
-					// 0 = any serial so always passes
-					if (serial == 0) {
-						continue;
-					}
-					else {
-						// we need to check sender owns the serial
-						const serialsOwned = serialsOwnedMap.get(tokenId);
-						const indexOfSerial = serialsOwned.indexOf(serial);
-						if (indexOfSerial < 0) {
-							console.log(`[ERROR]: sender (${senderAccountId}) does not own serial (${serial}) of token (${tokenId}) specified to send to ${tfr.receiverWallet}`);
-							tfr.message += `ERROR: requested to send a serial not owned ${tokenId} / #${serial} `;
-							skippedTfr.push(tfr);
-							serialCheckPassed = false;
-						}
-						else if (serialsOwned instanceof Array) {
-							// need to remove the serial to avoid it being randomly allocated to another tx
-							serialsOwned.splice(indexOfSerial, 1);
-						}
-					}
-				}
-				if (serialCheckPassed) nftTokenTfr.push(tfr);
-			}
-			else if (tokenType == 'HBAR') {
-				tfr.setSerials([0]);
-				hbarTfr.push(tfr);
-			}
-			else {
-				tfr.setSerials([0]);
-				fungibleTokenTfr.push(tfr);
-			}
-
-			const totalQty = (tokenQtyMap.get(tokenId) || 0) + Number(tfr.quantity);
-
-			tokenQtyMap.set(tokenId, totalQty);
-		}
-	}
-
-	// check we have enough tokens to meet the demand
-	let enoughTokens = true;
-	for (let t = 0; t < tokenArray.length; t++) {
-		const tokenId = tokenArray[t];
-		const requiredAmt = tokenQtyMap.get(tokenId);
-		const ownedAmt = ownedTokenMap.get(tokenId);
-		if (requiredAmt > ownedAmt) {
-			console.log(`[INFO]: ${tokenId} -> Sending ${requiredAmt} / owned ${ownedAmt} -> **FAILED**`);
-			enoughTokens = false;
-		}
-		else {
-			console.log(`[INFO]: ${tokenId} -> Sending ${requiredAmt} / owned ${ownedAmt} -> PASSED`);
-		}
-	}
-
-	if (isApproval) {
-		console.log('Overiding the balance check as using approval spending');
-	}
-	else if (!enoughTokens) {
-		console.log('Not enough tokens to meet the requested distribution - exiting');
-		exit(1);
-	}
-	else {
-		console.log('Running pre-allocation and assigning random serials where needed (**NOT DETERMINISTIC**)');
-	}
-
-	// check NFTs first
-	for (let n = 0; n < nftTokenTfr.length; n++) {
-		const tfr = nftTokenTfr[n];
-		if (tfr instanceof Transaction) {
-			// switch out any serials for a random allocation from those owned
-			const serialArr = tfr.serialArray;
-			for (let s = 0; s < serialArr.length; s++) {
-				let serial = serialArr[s];
-				if (serial == 0) {
-					// get a random serial
-					// serials array is shuffeld upon collection
-					const serialsAvailable = serialsOwnedMap.get(tfr.tokenId);
-					serial = serialsAvailable.pop();
-					serialArr.splice(s, 1, serial);
-				}
-			}
-
-			console.log(`[INFO]: NFT transfer to ${tfr.receiverWallet} for ${tfr.quantity} of ${tfr.tokenId} [serial(s) ${tfr.getSerialString()} selected]`);
-		}
-	}
-	// now fungible commons
-	for (let f = 0; f < fungibleTokenTfr.length; f++) {
-		const tfr = fungibleTokenTfr[f];
-		if (tfr instanceof Transaction) {
-			console.log(`[INFO]: Fungible transfer to ${tfr.receiverWallet} for ${tfr.quantity} of ${tfr.tokenId}`);
-		}
-	}
-
-	for (let skp = 0; skp < skippedTfr.length; skp++) {
-		const tfr = skippedTfr[skp];
-		if (tfr instanceof Transaction) {
-			console.log('[INFO]: Skipped in pre-flight check', tfr.toString());
-		}
-	}
-
-	if (test) {
-		console.log('TEST MODE: Exiting');
-		exit(0);
-	}
-
-	// get details for Hedera network
-	const myPrivateKey = PrivateKey.fromString(process.env.MY_PRIVATE_KEY);
-
-	// If we weren't able to grab it, we should throw a new error
-	if (senderAccountId == null ||
-        myPrivateKey == null) {
-		throw new Error('Environment variables for account ID / PKs / environment must be present');
-	}
-
-	if (env === undefined || env == null) {
-		console.log('Environment required, please specify test or main in the .env file');
-		return;
-	}
-
-	console.log(`Using account: ${senderAccountId} in ${env} environment with memo ${memo}`);
-
-	let client;
-	if (env == 'TEST') {
-		client = Client.forTestnet();
-		console.log('Sending tokens in *TESTNET*');
-	}
-	else if (env == 'MAIN') {
-		client = Client.forMainnet();
-		console.log('Sending tokens in *MAINNET*');
-	}
-	else {
-		console.log('ERROR: Must specify either MAIN or TEST as environment in .env file');
-		return;
-	}
-
-	client.setOperator(senderAccountId, myPrivateKey);
-
-	// Now send the tokens!
-	// process each NFT line seperately *BUT* need to batch if too many
-	let nftBatchSize = 10;
-	// step 1: break transactions into parts
-	// process easch instruction seperately to ensure success/failure lines up (less efficient of course).
-	// more important for NFTs given unique...FT can aggregate.
-	for (let n = 0; n < nftTokenTfr.length; n++) {
-		if (isApproval) {
-			console.log('Untested for using allowance spend on NFTs for airdrop - exiting');
-			process.exit(1);
-		}
-		const tfr = nftTokenTfr[n];
-		let txStatus = true;
-		if (tfr instanceof Transaction) {
-			const serialsList = tfr.serialArray;
-			for (let outer = 0; outer < serialsList.length; outer += nftBatchSize) {
-				const tokenTransferTx = new TransferTransaction();
-				for (let inner = 0; (inner < nftBatchSize) && ((outer + inner) < serialsList.length); inner++) {
-					const serial = serialsList[outer + inner];
-					tokenTransferTx.addNftTransfer(tfr.tokenId, serial, senderAccountId, tfr.receiverWallet);
-					if (verbose) console.log(`Adding serial ${serial} of ${tfr.tokenId} to tx to send to ${tfr.receiverWallet} from ${senderAccountId}`);
-				}
-				// assumes the account sending is treasury account
-				if (verbose) console.log('Sending NFT(s)');
-				tokenTransferTx
-					.setTransactionMemo(memo)
-					.freezeWith(client);
-
-				// sign
-				const signedTx = await tokenTransferTx.sign(myPrivateKey);
-				// submit
-				try {
-					const tokenTransferSubmit = await signedTx.execute(client);
-					// check it worked
-					const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-					console.log('Tx processed - status:', tokenTransferRx.status.toString());
-					if (tokenTransferRx.status.toString() != 'SUCCESS') txStatus = false;
-				}
-				catch (err) {
-					console.log('Error occured executing tx:', err);
-					txStatus = false;
-				}
-			}
-			tfr.success = txStatus;
-		}
-	}
-
-	// will be rare to send a list of different FC tokens in a single batch
-	// ASSUMPTION: the token being sent is likely grouped so try and complete maximum tx in each batch (unless token changes)
-
-	// update batch size to be 9 account and 1 -ve tx to debit treasury.
-	if (sendFTlineByLine) {
-		nftBatchSize = 1;
-		console.log('User request to send FTs on a per line basis');
-	}
-	else {
-		nftBatchSize = 9;
-	}
-	// not wrapped in try/catch as not recoverable anyway.
-	for (let outer = 0; outer < fungibleTokenTfr.length; outer += nftBatchSize) {
-		let tokenTransferTx = new TransferTransaction();
-		let decimals;
-		let pmtSum = 0;
-		let lastToken = '';
-		let txBeingProcessedIndex = [];
-		let txStatus = true;
-		for (let inner = 0; (inner < nftBatchSize) && ((outer + inner) < fungibleTokenTfr.length); inner++) {
-			const tfr = fungibleTokenTfr[outer + inner];
-			if (tfr instanceof Transaction) {
-				const tokenToSend = tfr.tokenId;
-				decimals = tokenDecimalsMap.get(tokenToSend);
-				if (verbose) console.log(`using decimals ${decimals} for token ${tokenToSend}`);
-				if (tokenToSend != lastToken) {
-					if (pmtSum > 0) {
-						// we need to process existing txs
-						if (verbose) console.log(`(token shift) Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
-						if (isApproval) {
-							tokenTransferTx
-								.addApprovedTokenTransfer(lastToken, approvalAcct, -pmtSum * (10 ** decimals))
-								.setTransactionId(TransactionId.generate(senderAccountId));
-						}
-						else {
-							tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
-						}
-						if (verbose) console.log('Processing transfer');
-						tokenTransferTx
-							.setTransactionMemo(memo)
-							.freezeWith(client);
-						// sign
-						const signedTx = await tokenTransferTx.sign(myPrivateKey);
-						// submit
-						try {
-							const tokenTransferSubmit = await signedTx.execute(client);
-							// check it worked
-							const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-							const rxStatus = tokenTransferRx.status.toString();
-							console.log('Tx processed - status:', rxStatus);
-							if (rxStatus != 'SUCCESS') txStatus = false;
-						}
-						catch (err) {
-							console.log('Error occured executing tx:', err);
-							txStatus = false;
-						}
-
-						for (let t = 0; t < txBeingProcessedIndex.length; t++) {
-							fungibleTokenTfr[txBeingProcessedIndex[t]].success = txStatus;
-						}
-					}
-					pmtSum = 0;
-					lastToken = tokenToSend;
-					txBeingProcessedIndex = [];
-					tokenTransferTx = new TransferTransaction();
-					txStatus = true;
-				}
-				const pmt = Number(tfr.quantity);
-				pmtSum += pmt;
-				tokenTransferTx.addTokenTransfer(tfr.tokenId, tfr.receiverWallet, tfr.quantity * (10 ** decimals));
-				if (verbose) {
-					console.log(`..adding transfer for ${tfr.quantity} of ${tfr.tokenId} to ${tfr.receiverWallet}.\t-> running total: ${pmtSum}`);
-				}
-				txBeingProcessedIndex.push((outer + inner));
-			}
-		}
-
-		if (verbose) console.log(`Adding treasury debit of ${-pmtSum} for ${lastToken} from ${senderAccountId}`);
-
-		if (isApproval) {
-			tokenTransferTx
-				.addApprovedTokenTransfer(lastToken, approvalAcct, -pmtSum * (10 ** decimals))
-				.setTransactionId(TransactionId.generate(senderAccountId));
-		}
-		else {
-			tokenTransferTx.addTokenTransfer(lastToken, senderAccountId, -pmtSum * (10 ** decimals));
-		}
-		if (verbose) console.log('Processing transfer');
-
-		tokenTransferTx
-			.setTransactionMemo(memo)
-			.freezeWith(client);
-		// sign
-		const signedTx = await tokenTransferTx.sign(myPrivateKey);
-		// submit
-		try {
-			const tokenTransferSubmit = await signedTx.execute(client);
-			// check it worked
-			const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-			const rxStatus = tokenTransferRx.status.toString();
-			console.log('Tx processed - status:', rxStatus);
-			if (rxStatus != 'SUCCESS') txStatus = false;
-		}
-		catch (err) {
-			console.log('Error occured executing tx:', err);
-			txStatus = false;
-		}
-
-		for (let t = 0; t < txBeingProcessedIndex.length; t++) {
-			fungibleTokenTfr[txBeingProcessedIndex[t]].success = txStatus;
-		}
-	}
-	// now process hbar transfers
-	// not wrapped in try/catch as not recoverable anyway.
-	nftBatchSize = 9;
-	for (let outer = 0; outer < hbarTfr.length; outer += nftBatchSize) {
-		const tokenTransferTx = new TransferTransaction();
-		let pmtSum = 0;
-		const txBeingProcessedIndex = [];
-		let txStatus = true;
-		for (let inner = 0; (inner < nftBatchSize) && ((outer + inner) < hbarTfr.length); inner++) {
-			const tfr = hbarTfr[outer + inner];
-			if (tfr instanceof Transaction) {
-				const pmt = Number(tfr.quantity);
-				pmtSum = Math.round((pmtSum + pmt) * 1e8) / 1e8;
-				tokenTransferTx.addHbarTransfer(tfr.receiverWallet, new Hbar(tfr.quantity, HbarUnit.Hbar));
-				if (verbose) {
-					console.log(`..adding transfer for ${tfr.quantity} of ${tfr.tokenId} to ${tfr.receiverWallet}.\t-> running total: ${pmtSum}`);
-				}
-				txBeingProcessedIndex.push((outer + inner));
-			}
-		}
-
-		if (verbose) console.log(`Adding treasury debit of ${-pmtSum} HBAR from ${senderAccountId}`);
-		if (isApproval) {
-			tokenTransferTx
-				.addApprovedHbarTransfer(approvalAcct, new Hbar(-pmtSum, HbarUnit.Hbar))
-				.setTransactionId(TransactionId.generate(senderAccountId));
-		}
-		else {
-			tokenTransferTx.addHbarTransfer(senderAccountId, new Hbar(-pmtSum, HbarUnit.Hbar));
-		}
-		if (verbose) console.log('Processing transfer');
-
-		tokenTransferTx
-			.setTransactionMemo(memo)
-			.freezeWith(client);
-		// sign
-		const signedTx = await tokenTransferTx.sign(myPrivateKey);
-		// submit
-		try {
-			const tokenTransferSubmit = await signedTx.execute(client);
-			// check it worked
-			const tokenTransferRx = await tokenTransferSubmit.getReceipt(client);
-			const rxStatus = tokenTransferRx.status.toString();
-			console.log('Tx processed - status:', rxStatus);
-			if (rxStatus != 'SUCCESS') txStatus = false;
-		}
-		catch (err) {
-			console.log('Error occured executing tx:', err);
-			txStatus = false;
-		}
-
-		for (let t = 0; t < txBeingProcessedIndex.length; t++) {
-			hbarTfr[txBeingProcessedIndex[t]].success = txStatus;
-		}
-	}
-
-	// TODO keep a log of user tokens before and after to check it worked
-	// subject to mirror node refresh speed...
-
-	// this will reorder the lines -- if user feedback request could maintain ordering
-	// concat to an empty array to be sure we always pass back something.
-	return [[...nftTokenTfr, ...fungibleTokenTfr, ...hbarTfr], skippedTfr];
-}
-
-async function getTokenBalanceMap(tokenId) {
-
-	let routeUrl = '/api/v1/tokens/' + tokenId + '/balances/';
-	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
-	const tokenBalMap = new Map();
-	try {
-		do {
-			if (verbose) console.log(baseUrl + routeUrl);
-			const json = await fetchJson(baseUrl + routeUrl);
-			if (json == null) {
-				console.log('FATAL ERROR: no NFTs found', baseUrl + routeUrl);
-				// unlikely to get here but a sensible default
-				return;
-			}
-
-			for (let b = 0 ; b < json.balances.length; b++) {
-				const entry = json.balances[b];
-				const account = entry.account;
-				const balance = entry.balance;
-
-				tokenBalMap.set(account, balance);
-			}
-
-			routeUrl = json.links.next;
-		}
-		while (routeUrl);
-		if (verbose) console.log(tokenBalMap);
-		return tokenBalMap;
-	}
-	catch (err) {
-		console.log('Trying to find balances for', tokenId, baseUrl, routeUrl);
-		console.error(err);
-		exit(1);
+	/**
+	 * Convert to JSON for output
+	 * @returns {Object}
+	 */
+	toJSON() {
+		return {
+			receiverWallet: this.receiverWallet,
+			tokenId: this.tokenId,
+			quantity: this.quantity,
+			serials: this.serialArray,
+			message: this.message,
+			success: this.success,
+			txId: this.txId,
+			retryCount: this.retryCount,
+		};
 	}
 }
 
-async function getSerialsOwned(tokenId, wallet, excludeSerialsList = []) {
-	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
+// ============================================================================
+// CHECKPOINT SYSTEM
+// ============================================================================
 
-	const serialArr = [];
-	let routeUrl = '/api/v1/tokens/' + tokenId + '/nfts?account.id=' + wallet;
-
-	console.log('Fetching serials owned: ', baseUrl + routeUrl);
+/**
+ * Save checkpoint to allow resume
+ * @param {string} filename - Base filename being processed
+ * @param {Transaction[]} completed - Completed transactions
+ * @param {Transaction[]} pending - Pending transactions
+ */
+function saveCheckpoint(filename, completed, pending) {
+	const checkpointFile = `.checkpoint_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
+	const checkpoint = {
+		timestamp: new Date().toISOString(),
+		filename,
+		completed: completed.map(t => t.toJSON()),
+		pending: pending.map(t => t.toJSON()),
+	};
 
 	try {
-		do {
-			const json = await fetchJson(baseUrl + routeUrl);
-
-			for (let n = 0; n < json.nfts.length; n++) {
-				const nft = json.nfts[n];
-				const serial = nft.serial_number;
-				if (!excludeSerialsList.includes(serial)) serialArr.push(serial);
-			}
-
-			routeUrl = json.links.next;
-		}
-		while (routeUrl);
-
-		// ensure the array of serials is randomised.
-		return shuffleArray(serialArr);
-	}
-	catch (err) {
-		console.log('Trying to find serials owned', wallet, baseUrl, routeUrl, serialArr);
-		console.error(err);
-		exit(1);
+		fs.writeFileSync(checkpointFile, JSON.stringify(checkpoint, null, 2));
+	} catch (err) {
+		console.error('Warning: Failed to save checkpoint:', err.message);
 	}
 }
 
-async function getHbarBalance(accountId) {
-	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
-	const routeUrl = `/api/v1/accounts/${accountId}/`;
+/**
+ * Load checkpoint if exists
+ * @param {string} filename - Base filename being processed
+ * @returns {Object|null} - Checkpoint data or null
+ */
+function loadCheckpoint(filename) {
+	const checkpointFile = `.checkpoint_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
 
-	const accountJSON = await fetchJson(baseUrl + routeUrl);
-
-	const acctBalance = accountJSON.balance.balance * 10 ** -8;
-
-	return acctBalance;
-}
-
-async function getTokenType(tokenId) {
-	const baseUrl = env == 'MAIN' ? baseUrlForMainnet : baseUrlForTestnet;
-	const routeUrl = `/api/v1/tokens/${tokenId}`;
-
-	const tokenDetailJSON = await fetchJson(baseUrl + routeUrl);
-
-	return [tokenDetailJSON.type, tokenDetailJSON.decimals];
-}
-
-async function fetchJson(url, depth = 0) {
-	if (depth >= maxRetries) return null;
-	if (depth > (maxRetries / 2) && verbose) console.log('Attempt: ', depth, url);
-	depth++;
 	try {
-		const res = await fetchWithTimeout(url);
-		if (res.status != 200) {
-			await sleep(500 * depth);
-			return await fetchJson(url, depth);
+		if (fs.existsSync(checkpointFile)) {
+			const data = fs.readFileSync(checkpointFile, 'utf-8');
+			return JSON.parse(data);
 		}
-		return res.json();
+	} catch (err) {
+		console.error('Warning: Failed to load checkpoint:', err.message);
 	}
-	catch (err) {
-		await sleep(500 * depth);
-		return await fetchJson(url, depth);
+
+	return null;
+}
+
+/**
+ * Delete checkpoint file
+ * @param {string} filename - Base filename being processed
+ */
+function deleteCheckpoint(filename) {
+	const checkpointFile = `.checkpoint_${filename.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+	try {
+		if (fs.existsSync(checkpointFile)) {
+			fs.unlinkSync(checkpointFile);
+		}
+	} catch (err) {
+		console.error('Warning: Failed to delete checkpoint:', err.message);
 	}
 }
 
-function getArg(arg) {
-	const customIndex = process.argv.indexOf(`-${arg}`);
-	let customValue;
+/**
+ * Restore transactions from checkpoint
+ * @param {Object} checkpoint - Checkpoint data
+ * @returns {[Transaction[], Transaction[]]} - [completed, pending]
+ */
+function restoreFromCheckpoint(checkpoint) {
+	const completed = checkpoint.completed.map(data => {
+		const tx = new Transaction(
+			data.receiverWallet,
+			data.tokenId,
+			data.quantity,
+			data.serials,
+			data.message,
+			data.success,
+			false
+		);
+		tx.txId = data.txId;
+		tx.retryCount = data.retryCount;
+		return tx;
+	});
 
-	if (customIndex > -1) {
-		// Retrieve the value after --custom
-		customValue = process.argv[customIndex + 1];
+	const pending = checkpoint.pending.map(data => {
+		const tx = new Transaction(
+			data.receiverWallet,
+			data.tokenId,
+			data.quantity,
+			data.serials,
+			data.message,
+			data.success,
+			false
+		);
+		tx.retryCount = data.retryCount;
+		return tx;
+	});
+
+	return [completed, pending];
+}
+
+// ============================================================================
+// LOGGING & PROGRESS
+// ============================================================================
+
+/**
+ * Log with timestamp
+ * @param {string} level - Log level (INFO, WARN, ERROR)
+ * @param {string} message - Message to log
+ * @param {Config} config - Configuration
+ */
+function log(level, message, config) {
+	const timestamp = new Date().toISOString();
+	console.log(`[${timestamp}] [${level}] ${message}`);
+}
+
+/**
+ * Show progress bar
+ * @param {number} current - Current progress
+ * @param {number} total - Total items
+ * @param {string} label - Progress label
+ */
+function showProgress(current, total, label = 'Progress') {
+	const percentage = Math.round((current / total) * 100);
+	const barLength = 40;
+	const filledLength = Math.round((barLength * current) / total);
+	const bar = '█'.repeat(filledLength) + '░'.repeat(barLength - filledLength);
+
+	process.stdout.write(`\r${label}: [${bar}] ${percentage}% (${current}/${total})`);
+
+	if (current === total) {
+		process.stdout.write('\n');
+	}
+}
+
+// ============================================================================
+// FILE I/O
+// ============================================================================
+
+/**
+ * Read and parse CSV file
+ * @param {string} filePath - Path to CSV file
+ * @param {Config} config - Configuration
+ * @returns {Promise<[Transaction[], Transaction[], Map]>} - [transfers, skipped, tokenBalanceMaps]
+ */
+async function readAirdropFile(filePath, config) {
+	const tokenTransfers = [];
+	const skippedTfrs = [];
+	const userAmtMap = new Map();
+	const tokenBalancesMaps = new Map();
+
+	// Ensure file exists
+	if (!fs.existsSync(filePath)) {
+		console.log(`File ${filePath} does not exist. Creating empty file.`);
+		fs.writeFileSync(filePath, '# destWallet,tokenToSend,quantity,serial(s)\n');
+		throw new Error(`Created empty file at ${filePath}. Please add airdrop data and run again.`);
 	}
 
-	return customValue;
-}
+	const allFileContents = fs.readFileSync(filePath, 'utf-8');
+	const lines = allFileContents.split(/\r?\n/);
 
-function getArgFlag(arg) {
-	const customIndex = process.argv.indexOf(`-${arg}`);
+	log('INFO', `Processing ${lines.length} lines from ${filePath}`, config);
 
-	if (customIndex > -1) {
-		return true;
+	for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+		const line = lines[lineNum].trim();
+
+		// Skip empty lines and comments
+		if (!line || line.startsWith('#')) continue;
+
+		// Validate wallet format
+		if (!/^0\.0\.[1-9][0-9]+,/i.test(line)) {
+			log('WARN', `Line ${lineNum + 1}: Skipping - invalid wallet format: ${line}`, config);
+			continue;
+		}
+
+		const parts = line.split(',');
+		if (parts.length < 3) {
+			log('WARN', `Line ${lineNum + 1}: Skipping - insufficient columns: ${line}`, config);
+			continue;
+		}
+
+		const [receiverWallet, tokenId, qtyStr, ...serialParts] = parts;
+		const quantity = Number(qtyStr);
+		const serialArray = serialParts.length === 0 ? [0] : serialParts.map(s => Number(s.trim())).filter(s => !isNaN(s));
+
+		if (isNaN(quantity) || quantity <= 0) {
+			log('WARN', `Line ${lineNum + 1}: Skipping - invalid quantity: ${line}`, config);
+			const tx = new Transaction(receiverWallet, tokenId, 0, [0], 'INVALID QUANTITY: **SKIPPED**', false, false);
+			skippedTfrs.push(tx);
+			continue;
+		}
+
+		// Check wallet association for tokens (not hbar)
+		let walletAssociated = true;
+		if (tokenId.toLowerCase() !== 'hbar') {
+			let tokenBalMap = tokenBalancesMaps.get(tokenId);
+			if (!tokenBalMap) {
+				if (config.verbose) log('INFO', `Building token/balance map for ${tokenId}`, config);
+				tokenBalMap = await getTokenBalanceMap(tokenId, config);
+				tokenBalancesMaps.set(tokenId, tokenBalMap);
+			}
+			walletAssociated = (tokenBalMap.get(receiverWallet) || 0) >= 0;
+		}
+
+		// Apply exclusions and limits
+		let amt = userAmtMap.get(receiverWallet) || 0;
+
+		if (config.excludeWallets.includes(receiverWallet)) {
+			const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'EXCLUDED WALLET: **SKIPPED**', false, false);
+			skippedTfrs.push(tx);
+		} else if (!walletAssociated) {
+			const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'NOT ASSOCIATED: **SKIPPED**', false, false);
+			skippedTfrs.push(tx);
+		} else if (config.maxTransferPerWallet !== null && (amt + quantity) > config.maxTransferPerWallet) {
+			const remCapacity = config.maxTransferPerWallet - amt;
+			if (remCapacity > 0) {
+				amt += remCapacity;
+				const tx = new Transaction(receiverWallet, tokenId, remCapacity, serialArray, `MAX TRANSFER LIMIT: Reduced by ${quantity - remCapacity}`, false);
+				tokenTransfers.push(tx);
+			} else {
+				const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, 'MAX TRANSFER LIMIT: **SKIPPED**', false, false);
+				skippedTfrs.push(tx);
+			}
+		} else {
+			const tx = new Transaction(receiverWallet, tokenId, quantity, serialArray, '', false);
+			tokenTransfers.push(tx);
+			amt += quantity;
+		}
+
+		userAmtMap.set(receiverWallet, amt);
 	}
 
-	return false;
+	log('INFO', `Loaded ${tokenTransfers.length} transfers, ${skippedTfrs.length} skipped`, config);
+	return [tokenTransfers, skippedTfrs, tokenBalancesMaps];
 }
 
-function sleep(ms) {
-	return new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Write results to CSV and JSON
+ * @param {Transaction[]} completed - Completed transactions
+ * @param {Transaction[]} skipped - Skipped transactions
+ * @param {Transaction[]} failed - Failed transactions
+ * @param {string} filename - Original filename
+ * @param {Config} config - Configuration
+ */
+function writeResults(completed, skipped, failed, filename, config) {
+	const timestamp = new Date().toISOString();
+	const baseName = filename.replace(/^\.\//, '').replace(/\.csv$/, '');
+
+	// CSV Output (human-readable)
+	const csvFilename = `output_${baseName}_${timestamp.replace(/[:.]/g, '-')}.csv`;
+	let csvContent = `# Airdrop Results - ${timestamp}\n`;
+	csvContent += `# Status,Destination,Token,Quantity,Serials,Message,TransactionID\n`;
+
+	for (const tx of completed) {
+		csvContent += `SUCCESS,${tx.toCsvRow()}\n`;
+	}
+	for (const tx of failed) {
+		csvContent += `FAILED,${tx.toCsvRow()}\n`;
+	}
+	for (const tx of skipped) {
+		csvContent += `SKIPPED,${tx.toCsvRow()}\n`;
+	}
+
+	fs.writeFileSync(csvFilename, csvContent);
+	log('INFO', `Results written to ${csvFilename}`, config);
+
+	// JSON Output (machine-readable)
+	const jsonFilename = `output_${baseName}_${timestamp.replace(/[:.]/g, '-')}.json`;
+	const jsonOutput = {
+		timestamp,
+		summary: {
+			total: completed.length + failed.length + skipped.length,
+			completed: completed.length,
+			failed: failed.length,
+			skipped: skipped.length,
+		},
+		transactions: {
+			completed: completed.map(t => t.toJSON()),
+			failed: failed.map(t => t.toJSON()),
+			skipped: skipped.map(t => t.toJSON()),
+		},
+	};
+
+	fs.writeFileSync(jsonFilename, JSON.stringify(jsonOutput, null, 2));
+	log('INFO', `JSON results written to ${jsonFilename}`, config);
+
+	// Print summary
+	console.log('\n' + '='.repeat(60));
+	console.log('AIRDROP SUMMARY');
+	console.log('='.repeat(60));
+	console.log(`✓ Completed: ${completed.length}`);
+	console.log(`✗ Failed:    ${failed.length}`);
+	console.log(`⊗ Skipped:   ${skipped.length}`);
+	console.log(`  Total:     ${completed.length + failed.length + skipped.length}`);
+	console.log('='.repeat(60));
 }
 
+// ============================================================================
+// MIRROR NODE API
+// ============================================================================
+
+/**
+ * Fetch JSON with retries and exponential backoff
+ * @param {string} url - URL to fetch
+ * @param {number} maxRetries - Max retry attempts
+ * @param {number} depth - Current retry depth
+ * @returns {Promise<Object|null>}
+ */
+async function fetchJson(url, maxRetries = 10, depth = 0) {
+	if (depth >= maxRetries) {
+		console.error(`Max retries (${maxRetries}) exceeded for: ${url}`);
+		return null;
+	}
+
+	try {
+		const res = await fetchWithTimeout(url, { timeout: 30000 });
+		if (res.status === 200) {
+			return await res.json();
+		}
+
+		// Exponential backoff
+		const delay = Math.min(1000 * Math.pow(2, depth), 30000);
+		await sleep(delay);
+		return await fetchJson(url, maxRetries, depth + 1);
+	} catch (err) {
+		const delay = Math.min(1000 * Math.pow(2, depth), 30000);
+		await sleep(delay);
+		return await fetchJson(url, maxRetries, depth + 1);
+	}
+}
+
+/**
+ * Fetch with timeout
+ * @param {string} resource - URL
+ * @param {Object} options - Fetch options
+ * @returns {Promise<Response>}
+ */
 async function fetchWithTimeout(resource, options = {}) {
 	const { timeout = 30000 } = options;
 	const controller = new AbortController();
 	const id = setTimeout(() => controller.abort(), timeout);
-	const response = await fetch(resource, {
-		...options,
-		signal: controller.signal,
-	});
-	clearTimeout(id);
-	return response;
+
+	try {
+		const response = await fetch(resource, {
+			...options,
+			signal: controller.signal,
+		});
+		clearTimeout(id);
+		return response;
+	} catch (err) {
+		clearTimeout(id);
+		throw err;
+	}
 }
 
+/**
+ * Get token balance map for all holders
+ * @param {string} tokenId - Token ID
+ * @param {Config} config - Configuration
+ * @returns {Promise<Map<string, number>>}
+ */
+async function getTokenBalanceMap(tokenId, config) {
+	const tokenBalMap = new Map();
+	let routeUrl = `/api/v1/tokens/${tokenId}/balances/`;
+
+	try {
+		do {
+			const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
+			if (!json) {
+				console.error(`ERROR: No balances found for ${tokenId}`);
+				exit(1);
+			}
+
+			for (const entry of json.balances) {
+				tokenBalMap.set(entry.account, entry.balance);
+			}
+
+			routeUrl = json.links.next;
+		} while (routeUrl);
+
+		return tokenBalMap;
+	} catch (err) {
+		console.error(`Error fetching balances for ${tokenId}:`, err);
+		exit(1);
+	}
+}
+
+/**
+ * Get serials owned by wallet
+ * @param {string} tokenId - Token ID
+ * @param {string} wallet - Wallet address
+ * @param {number[]} excludeSerials - Serials to exclude
+ * @param {Config} config - Configuration
+ * @returns {Promise<number[]>}
+ */
+async function getSerialsOwned(tokenId, wallet, excludeSerials, config) {
+	const serialArr = [];
+	let routeUrl = `/api/v1/tokens/${tokenId}/nfts?account.id=${wallet}`;
+
+	try {
+		do {
+			const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
+			if (!json) break;
+
+			for (const nft of json.nfts) {
+				const serial = nft.serial_number;
+				if (!excludeSerials.includes(serial)) {
+					serialArr.push(serial);
+				}
+			}
+
+			routeUrl = json.links.next;
+		} while (routeUrl);
+
+		return shuffleArray(serialArr);
+	} catch (err) {
+		console.error(`Error fetching serials for ${tokenId}/${wallet}:`, err);
+		exit(1);
+	}
+}
+
+/**
+ * Get HBAR balance
+ * @param {string} accountId - Account ID
+ * @param {Config} config - Configuration
+ * @returns {Promise<number>}
+ */
+async function getHbarBalance(accountId, config) {
+	const routeUrl = `/api/v1/accounts/${accountId}/`;
+	const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
+	return json.balance.balance * 1e-8;
+}
+
+/**
+ * Get token type and decimals
+ * @param {string} tokenId - Token ID
+ * @param {Config} config - Configuration
+ * @returns {Promise<[string, number]>}
+ */
+async function getTokenType(tokenId, config) {
+	const routeUrl = `/api/v1/tokens/${tokenId}`;
+	const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
+	return [json.type, json.decimals];
+}
+
+// ============================================================================
+// TRANSACTION PROCESSING
+// ============================================================================
+
+/**
+ * Pre-flight validation and serial allocation
+ * @param {Transaction[]} transfers - Transfers to validate
+ * @param {Map} tokenBalancesMaps - Token balance maps
+ * @param {Config} config - Configuration
+ * @returns {Promise<[Transaction[], Transaction[], Transaction[], Transaction[], Map]>} - [nft, ft, hbar, skipped, tokenDecimals]
+ */
+async function validateAndPrepareTransfers(transfers, tokenBalancesMaps, config) {
+	log('INFO', 'Starting pre-flight validation...', config);
+
+	const nftTransfers = [];
+	const ftTransfers = [];
+	const hbarTransfers = [];
+	const skipped = [];
+
+	const tokenTypeMap = new Map();
+	const tokenDecimalsMap = new Map();
+	const tokenQtyMap = new Map();
+	const ownedTokenMap = new Map();
+	const serialsOwnedMap = new Map();
+
+	// Build token metadata
+	for (const tfr of transfers) {
+		const tokenId = tfr.tokenId.toLowerCase();
+
+		if (tokenTypeMap.has(tokenId)) continue;
+
+		if (tokenId === 'hbar') {
+			tokenTypeMap.set(tokenId, 'HBAR');
+			const hbarBal = await getHbarBalance(config.senderAccountId, config);
+			ownedTokenMap.set(tokenId, hbarBal);
+		} else {
+			const [tokenType, decimals] = await getTokenType(tokenId, config);
+			tokenTypeMap.set(tokenId, tokenType);
+			tokenDecimalsMap.set(tokenId, decimals);
+
+			const tknBalMap = tokenBalancesMaps.get(tokenId);
+			const bal = tknBalMap.get(config.senderAccountId) || 0;
+
+			if (tokenType === 'NON_FUNGIBLE_UNIQUE') {
+				const serialsOwned = await getSerialsOwned(tokenId, config.senderAccountId, config.excludeSerials, config);
+				serialsOwnedMap.set(tokenId, serialsOwned);
+				ownedTokenMap.set(tokenId, serialsOwned.length);
+			} else if (tokenType === 'FUNGIBLE_COMMON') {
+				const balDecimalAdjusted = bal * Math.pow(10, -decimals);
+				ownedTokenMap.set(tokenId, balDecimalAdjusted);
+			} else {
+				log('ERROR', `Invalid token type for ${tokenId}: ${tokenType}`, config);
+				tfr.message = `ERROR: Invalid token type ${tokenType}`;
+				skipped.push(tfr);
+				continue;
+			}
+		}
+	}
+
+	// Validate and categorize transfers
+	for (const tfr of transfers) {
+		const tokenId = tfr.tokenId.toLowerCase();
+		const tokenType = tokenTypeMap.get(tokenId);
+
+		// Track total quantity per token
+		const totalQty = (tokenQtyMap.get(tokenId) || 0) + tfr.quantity;
+		tokenQtyMap.set(tokenId, totalQty);
+
+		if (tokenType === 'NON_FUNGIBLE_UNIQUE') {
+			// Validate NFT serials
+			const serialArray = tfr.serialArray;
+			const anyExcluded = serialArray.some(s => config.excludeSerials.includes(s));
+
+			if (anyExcluded) {
+				tfr.message = 'ERROR: Requested serial is on EXCLUDE list';
+				skipped.push(tfr);
+				continue;
+			}
+
+			let serialCheckPassed = true;
+			for (let i = 0; i < serialArray.length; i++) {
+				const serial = serialArray[i];
+				if (serial === 0) continue;
+
+				const serialsOwned = serialsOwnedMap.get(tokenId);
+				const idx = serialsOwned.indexOf(serial);
+				if (idx < 0) {
+					tfr.message = `ERROR: Sender does not own serial ${serial}`;
+					skipped.push(tfr);
+					serialCheckPassed = false;
+					break;
+				} else {
+					serialsOwned.splice(idx, 1);
+				}
+			}
+
+			if (serialCheckPassed) nftTransfers.push(tfr);
+		} else if (tokenType === 'HBAR') {
+			tfr.setSerials([0]);
+			hbarTransfers.push(tfr);
+		} else {
+			tfr.setSerials([0]);
+			ftTransfers.push(tfr);
+		}
+	}
+
+	// Check sufficient balances
+	let enoughTokens = true;
+	for (const [tokenId, requiredAmt] of tokenQtyMap.entries()) {
+		const ownedAmt = ownedTokenMap.get(tokenId) || 0;
+		const status = requiredAmt <= ownedAmt ? 'PASSED' : '**FAILED**';
+		log('INFO', `${tokenId} -> Sending ${requiredAmt} / Owned ${ownedAmt} -> ${status}`, config);
+
+		if (requiredAmt > ownedAmt && !config.isApproval) {
+			enoughTokens = false;
+		}
+	}
+
+	if (!enoughTokens && !config.isApproval) {
+		log('ERROR', 'Insufficient tokens to complete airdrop', config);
+		exit(1);
+	}
+
+	// Allocate random serials for NFTs
+	log('INFO', 'Allocating random serials where needed...', config);
+	for (const tfr of nftTransfers) {
+		const serialArr = tfr.serialArray;
+		for (let i = 0; i < serialArr.length; i++) {
+			if (serialArr[i] === 0) {
+				const serialsAvailable = serialsOwnedMap.get(tfr.tokenId);
+				const serial = serialsAvailable.pop();
+				serialArr[i] = serial;
+			}
+		}
+	}
+
+	return [nftTransfers, ftTransfers, hbarTransfers, skipped, tokenDecimalsMap];
+}
+
+/**
+ * Execute a single transfer transaction
+ * @param {Transaction} tfr - Transfer to execute
+ * @param {Client} client - Hedera client
+ * @param {PrivateKey} privateKey - Private key
+ * @param {Config} config - Configuration
+ * @param {Map} tokenDecimalsMap - Token decimals map
+ * @returns {Promise<boolean>} - Success status
+ */
+async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecimalsMap) {
+	try {
+		const tokenTransferTx = new TransferTransaction();
+		const tokenId = tfr.tokenId.toLowerCase();
+
+		if (tokenId === 'hbar') {
+			// HBAR transfer
+			tokenTransferTx.addHbarTransfer(tfr.receiverWallet, new Hbar(tfr.quantity, HbarUnit.Hbar));
+
+			if (config.isApproval) {
+				tokenTransferTx
+					.addApprovedHbarTransfer(config.approvalAcct, new Hbar(-tfr.quantity, HbarUnit.Hbar))
+					.setTransactionId(TransactionId.generate(config.senderAccountId));
+			} else {
+				tokenTransferTx.addHbarTransfer(config.senderAccountId, new Hbar(-tfr.quantity, HbarUnit.Hbar));
+			}
+		} else if (tfr.serialArray.length > 0 && tfr.serialArray[0] !== 0) {
+			// NFT transfer
+			for (const serial of tfr.serialArray) {
+				tokenTransferTx.addNftTransfer(tokenId, serial, config.senderAccountId, tfr.receiverWallet);
+			}
+		} else {
+			// Fungible token transfer
+			const decimals = tokenDecimalsMap.get(tokenId) || 0;
+			const adjustedQty = tfr.quantity * Math.pow(10, decimals);
+
+			tokenTransferTx.addTokenTransfer(tokenId, tfr.receiverWallet, adjustedQty);
+
+			if (config.isApproval) {
+				tokenTransferTx
+					.addApprovedTokenTransfer(tokenId, config.approvalAcct, -adjustedQty)
+					.setTransactionId(TransactionId.generate(config.senderAccountId));
+			} else {
+				tokenTransferTx.addTokenTransfer(tokenId, config.senderAccountId, -adjustedQty);
+			}
+		}
+
+		tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
+		const signedTx = await tokenTransferTx.sign(privateKey);
+		const txSubmit = await signedTx.execute(client);
+		const receipt = await txSubmit.getReceipt(client);
+
+		tfr.txId = txSubmit.transactionId.toString();
+		tfr.success = receipt.status.toString() === 'SUCCESS';
+		tfr.message = tfr.success ? 'Completed' : `Failed: ${receipt.status.toString()}`;
+
+		return tfr.success;
+	} catch (err) {
+		tfr.success = false;
+		tfr.message = `Error: ${err.message}`;
+		return false;
+	}
+}
+
+/**
+ * Process transfers with concurrency control
+ * @param {Transaction[]} transfers - All transfers
+ * @param {Map} tokenDecimalsMap - Token decimals map
+ * @param {Config} config - Configuration
+ * @param {boolean} testMode - Test mode flag
+ * @returns {Promise<[Transaction[], Transaction[]]>} - [completed, failed]
+ */
+async function processTransfersParallel(transfers, tokenDecimalsMap, config, testMode) {
+	if (testMode) {
+		log('INFO', 'TEST MODE: Skipping actual transfers', config);
+		return [[], []];
+	}
+
+	log('INFO', `Processing ${transfers.length} transfers with max ${config.maxConcurrentTxs} concurrent`, config);
+
+	const myPrivateKey = PrivateKey.fromString(config.privateKey);
+	const client = config.network === 'mainnet'
+		? Client.forMainnet()
+		: config.network === 'testnet'
+			? Client.forTestnet()
+			: config.network === 'previewnet'
+				? Client.forPreviewnet()
+				: Client.forNetwork({});
+
+	client.setOperator(config.senderAccountId, myPrivateKey);
+
+	const completed = [];
+	const failed = [];
+	let processed = 0;
+
+	// Process in batches with concurrency limit
+	for (let i = 0; i < transfers.length; i += config.maxConcurrentTxs) {
+		const batch = transfers.slice(i, i + config.maxConcurrentTxs);
+
+		const promises = batch.map(tfr =>
+			executeSingleTransfer(tfr, client, myPrivateKey, config, tokenDecimalsMap)
+		);
+
+		const results = await Promise.allSettled(promises);
+
+		for (let j = 0; j < batch.length; j++) {
+			const tfr = batch[j];
+			const result = results[j];
+
+			if (result.status === 'fulfilled' && tfr.success) {
+				completed.push(tfr);
+			} else {
+				// Retry once on failure
+				if (tfr.retryCount === 0) {
+					tfr.retryCount++;
+					log('WARN', `Retrying failed transfer to ${tfr.receiverWallet}`, config);
+
+					await sleep(1000);
+					const retrySuccess = await executeSingleTransfer(tfr, client, myPrivateKey, config, tokenDecimalsMap);
+
+					if (retrySuccess) {
+						completed.push(tfr);
+					} else {
+						failed.push(tfr);
+					}
+				} else {
+					failed.push(tfr);
+				}
+			}
+
+			processed++;
+			showProgress(processed, transfers.length, 'Sending transfers');
+		}
+
+		// Rate limiting: brief pause between batches
+		if (i + config.maxConcurrentTxs < transfers.length) {
+			await sleep(100);
+		}
+	}
+
+	client.close();
+	return [completed, failed];
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+/**
+ * Shuffle array in place
+ * @param {Array} arr - Array to shuffle
+ * @returns {Array}
+ */
 function shuffleArray(arr) {
 	for (let i = arr.length - 1; i > 0; i--) {
 		const j = Math.floor(Math.random() * (i + 1));
@@ -852,108 +982,172 @@ function shuffleArray(arr) {
 	return arr;
 }
 
+/**
+ * Sleep for ms
+ * @param {number} ms - Milliseconds
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Get CLI argument value
+ * @param {string} arg - Argument name
+ * @returns {string|undefined}
+ */
+function getArg(arg) {
+	const idx = process.argv.indexOf(`-${arg}`);
+	return idx > -1 ? process.argv[idx + 1] : undefined;
+}
+
+/**
+ * Check if CLI flag is present
+ * @param {string} arg - Argument name
+ * @returns {boolean}
+ */
+function getArgFlag(arg) {
+	return process.argv.indexOf(`-${arg}`) > -1;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
 async function main() {
-	if (getArgFlag('h')) {
-		console.log('Usage: node tokenAirdrop.js -process <file> [-test] [-v]');
-		console.log('       -process <file>		the tokens to send');
-		console.log('       -test				process the file but nothign sent');
-		console.log('       -byline				force FTs to send line by line');
-		console.log('       	useful for when batches fail due to account with the token frozen');
-		console.log('       	only impacts FT transfers not NFT/hbar');
-		console.log('       -approval 0.0.ZZZ	transactions use Allowan on behalf of 0.0.ZZZ');
-		console.log('       	supported for FT / hbar only for now');
-		console.log('       -v          		verbose [debug]');
+	console.log('╔════════════════════════════════════════════════════════════╗');
+	console.log('║      Hedera Token Airdrop Script v1.0.0                   ║');
+	console.log('╚════════════════════════════════════════════════════════════╝\n');
+
+	if (getArgFlag('h') || getArgFlag('help')) {
+		console.log('Usage: node tokenAirdrop.js -process <file> [options]');
+		console.log('\nOptions:');
+		console.log('  -process <file>    CSV file with airdrop data (required)');
+		console.log('  -test              Validate without sending transactions');
+		console.log('  -validate          Alias for -test');
+		console.log('  -resume            Resume from checkpoint if available');
+		console.log('  -approval <id>     Use allowance from account <id>');
+		console.log('  -v                 Verbose logging');
+		console.log('  -h, -help          Show this help message');
+		console.log('\nExample:');
+		console.log('  node tokenAirdrop.js -process my-airdrop.csv');
+		console.log('  node tokenAirdrop.js -process my-airdrop.csv -test');
+		console.log('  node tokenAirdrop.js -process my-airdrop.csv -resume');
+		console.log('\nSee README.md for detailed documentation.');
 		return;
 	}
 
-	console.log('Using ENIVRONMENT:', env);
-	console.log('Using MEMO:', memo);
-
-	verbose = getArgFlag('v');
-
-	isApproval = getArgFlag('approval');
-	// form as AccountId to fail hard & fast if not in right format
-	if (isApproval) approvalAcct = AccountId.fromString(getArg('approval'));
-
-	const processFlag = getArgFlag('process');
 	const processFile = getArg('process');
-
-	const sendFTlineByLine = getArgFlag('byline');
-
-	const test = getArgFlag('test');
-
-	if (!processFlag) {
-		console.log('**MUST** specify a file to process -> -process <file>');
+	if (!processFile) {
+		console.error('ERROR: Must specify -process <file>');
+		console.log('Run with -h for help');
 		return;
 	}
 
-	// null implies NotApplicable
-	let maxTferAmt = null;
+	const testMode = getArgFlag('test') || getArgFlag('validate');
+	const resumeMode = getArgFlag('resume');
+
 	try {
-		maxTferAmt = Number(process.env.MAX_TRANSFER) || null;
-		if (maxTferAmt <= 0) maxTferAmt = null;
-	}
-	catch (_err) {
-		// swallow the error and assume no limit
-		maxTferAmt = null;
-	}
-	console.log('Using MAX_TRANSFER:', maxTferAmt);
+		const config = buildConfig();
 
-	const excludeWalletsEnv = process.env.EXCLUDE_WALLETS;
-	console.log('Using EXCLUDE WALLETS:', excludeWalletsEnv);
-	let excludeWalletsList = [];
-	if (excludeWalletsEnv !== undefined) {
-		excludeWalletsList = [].concat(excludeWalletsEnv.split(','));
-	}
+		log('INFO', `Network: ${config.network}`, config);
+		log('INFO', `Mirror Node: ${config.mirrorNodeUrl}`, config);
+		log('INFO', `Sender: ${config.senderAccountId}`, config);
+		log('INFO', `Memo: ${config.memo}`, config);
+		log('INFO', `Max Transfer Per Wallet: ${config.maxTransferPerWallet || 'unlimited'}`, config);
+		log('INFO', `Max Concurrent Txs: ${config.maxConcurrentTxs}`, config);
 
-	// read in file to process
-	const [tfrArray, skippedTfrs, tokenBalancesMaps] = await readDB(processFile, maxTferAmt, excludeWalletsList) ?? [[], [], new Map()];
-
-	const excludeSerialsEnv = process.env.EXCLUDE_SERIALS || null;
-	console.log('Using EXCLUDE_SERIALS:', excludeSerialsEnv);
-	const excludeSerialsList = [];
-	try {
-		if (excludeSerialsEnv === undefined || excludeSerialsEnv == null || excludeSerialsEnv == '') {
-			// no serials to exclude
-			if (verbose) console.log('**NO SERIALS TO EXCLUDE**');
+		if (config.excludeWallets.length > 0) {
+			log('INFO', `Excluded Wallets: ${config.excludeWallets.join(', ')}`, config);
 		}
-		// format csv or '-' for range
-		else if (excludeSerialsEnv.includes('-')) {
-		// inclusive range
-			const rangeSplit = excludeSerialsEnv.split('-');
-			for (let i = rangeSplit[0]; i <= rangeSplit[1]; i++) {
-				excludeSerialsList.push(i);
+		if (config.excludeSerials.length > 0) {
+			log('INFO', `Excluded Serials: ${config.excludeSerials.length} serials`, config);
+		}
+
+		let transfers, skipped, tokenBalancesMaps;
+		let completedFromCheckpoint = [];
+
+		// Check for checkpoint
+		if (resumeMode) {
+			const checkpoint = loadCheckpoint(processFile);
+			if (checkpoint) {
+				log('INFO', `Resuming from checkpoint (${checkpoint.completed.length} completed, ${checkpoint.pending.length} pending)`, config);
+				[completedFromCheckpoint, transfers] = restoreFromCheckpoint(checkpoint);
+
+				// Need to rebuild tokenBalancesMaps
+				tokenBalancesMaps = new Map();
+				const uniqueTokens = new Set(transfers.map(t => t.tokenId.toLowerCase()));
+				for (const tokenId of uniqueTokens) {
+					if (tokenId !== 'hbar') {
+						const balMap = await getTokenBalanceMap(tokenId, config);
+						tokenBalancesMaps.set(tokenId, balMap);
+					}
+				}
+				skipped = [];
+			} else {
+				log('WARN', 'No checkpoint found, starting fresh', config);
+				[transfers, skipped, tokenBalancesMaps] = await readAirdropFile(processFile, config);
 			}
+		} else {
+			[transfers, skipped, tokenBalancesMaps] = await readAirdropFile(processFile, config);
 		}
-		else if (excludeSerialsEnv.includes(',')) {
-			const csvSplit = excludeSerialsEnv.split(',');
-			for (let i = 0; i <= csvSplit.length; i++) {
-				const serial = Number(csvSplit[i]);
-				// ignore NaN / trailing junk
-				if (serial) excludeSerialsList.push(serial);
-			}
+
+		if (transfers.length === 0) {
+			log('WARN', 'No transfers to process', config);
+			return;
 		}
-		else {
-		// only one serial to check
-			excludeSerialsList.push(Number(excludeSerialsEnv));
+
+		// Validate and prepare
+		const [nftTransfers, ftTransfers, hbarTransfers, validationSkipped, tokenDecimalsMap] =
+			await validateAndPrepareTransfers(transfers, tokenBalancesMaps, config);
+
+		skipped.push(...validationSkipped);
+
+		const allTransfers = [...nftTransfers, ...ftTransfers, ...hbarTransfers];
+
+		if (testMode) {
+			console.log('\n' + '='.repeat(60));
+			console.log('TEST MODE - Summary:');
+			console.log('='.repeat(60));
+			console.log(`NFT Transfers:      ${nftTransfers.length}`);
+			console.log(`Fungible Transfers: ${ftTransfers.length}`);
+			console.log(`HBAR Transfers:     ${hbarTransfers.length}`);
+			console.log(`Skipped:            ${skipped.length}`);
+			console.log(`Total to Process:   ${allTransfers.length}`);
+			console.log('='.repeat(60));
+			return;
 		}
-		console.log('Serials marked for exclusion', excludeSerialsList);
-	}
-	catch (err) {
-		console.log('ERROR on defining serials to exclude', excludeSerialsEnv);
+
+		// Process transfers
+		const [completed, failed] = await processTransfersParallel(allTransfers, tokenDecimalsMap, config, testMode);
+
+		// Combine with checkpoint completions
+		const allCompleted = [...completedFromCheckpoint, ...completed];
+
+		// Save checkpoint if there are failures
+		if (failed.length > 0) {
+			log('WARN', `${failed.length} transfers failed, saving checkpoint`, config);
+			saveCheckpoint(processFile, allCompleted, failed);
+		} else {
+			// Clean up checkpoint on success
+			deleteCheckpoint(processFile);
+		}
+
+		// Write results
+		writeResults(allCompleted, skipped, failed, processFile, config);
+
+		if (failed.length > 0) {
+			console.log(`\n⚠ ${failed.length} transfers failed. Run with -resume to retry.`);
+		} else {
+			console.log('\n✓ All transfers completed successfully!');
+		}
+
+	} catch (err) {
+		console.error('\n❌ Fatal error:', err.message);
+		if (getArgFlag('v')) {
+			console.error(err.stack);
+		}
 		exit(1);
-	}
-
-	if (processFlag) {
-		// process the payment file
-		processTransfers(tfrArray, tokenBalancesMaps, excludeSerialsList, test, sendFTlineByLine).then(([processedTfrs, moreSkippedTfrs]) => {
-			const allSkippedTfrs = [...skippedTfrs, ...moreSkippedTfrs];
-			if (verbose) {
-				console.log('Processed tx:', processedTfrs);
-				console.log('Skipped tx:', allSkippedTfrs);
-			}
-			writeDB(processedTfrs, allSkippedTfrs, processFile);
-		});
 	}
 }
 

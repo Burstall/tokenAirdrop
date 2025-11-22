@@ -1,0 +1,28 @@
+# Example Airdrop File
+# Format: destWallet,tokenToSend,quantity,serial(s)
+# Lines starting with # are ignored
+# 
+# For NFTs:
+#   - Use serial numbers separated by commas (must match quantity)
+#   - Use 0 to send random NFTs from your wallet
+# For Fungible Tokens:
+#   - Omit serial column or use 0
+# For HBAR:
+#   - Use 'hbar' as tokenToSend
+#
+# Examples:
+
+# Send 5 specific NFT serials to wallet
+0.0.1234567,0.0.9876543,5,100,101,102,103,104
+
+# Send 1 random NFT from your collection
+0.0.2345678,0.0.9876543,1,0
+
+# Send 10 fungible tokens
+0.0.3456789,0.0.8765432,10
+
+# Send 2.5 HBAR
+0.0.4567890,hbar,2.5
+
+# Send multiple fungible tokens to same wallet
+0.0.5678901,0.0.7654321,100

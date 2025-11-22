@@ -2,6 +2,16 @@ node_modules
 .env
 /.DS_Store
 .eslintrc.json
-_*
-output_*
 package-lock.json
+
+# Ignore all CSV files except the example
+*.csv
+!example-airdrop.csv
+
+# Ignore output files
+output_*
+output*.csv
+output*.json
+
+# Ignore checkpoint files
+.checkpoint_*
