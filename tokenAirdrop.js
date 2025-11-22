@@ -44,7 +44,19 @@ import { exit } from 'process';
  * @returns {Config}
  */
 function buildConfig() {
-	const network = (process.env.NETWORK || 'mainnet').toLowerCase();
+	// Backward compatibility: check ENVIRONMENT first, then NETWORK
+	let network = process.env.NETWORK;
+	if (!network) {
+		const oldEnv = process.env.ENVIRONMENT;
+		if (oldEnv === 'MAIN') {
+			network = 'mainnet';
+		} else if (oldEnv === 'TEST') {
+			network = 'testnet';
+		} else {
+			network = 'mainnet'; // default
+		}
+	}
+	network = network.toLowerCase();
 
 	// Mirror node URL construction
 	let mirrorNodeUrl;
@@ -56,18 +68,8 @@ function buildConfig() {
 	} else if (['mainnet', 'testnet', 'previewnet'].includes(network)) {
 		mirrorNodeUrl = `https://${network}.mirrornode.hedera.com`;
 	} else {
-		// Backwards compatibility with old ENVIRONMENT variable
-		const oldEnv = process.env.ENVIRONMENT;
-		if (oldEnv === 'MAIN') {
-			mirrorNodeUrl = 'https://mainnet.mirrornode.hedera.com';
-		} else if (oldEnv === 'TEST') {
-			mirrorNodeUrl = 'https://testnet.mirrornode.hedera.com';
-		} else {
-			throw new Error(`Invalid NETWORK: ${network}. Use mainnet, testnet, previewnet, or custom`);
-		}
-	}
-
-	const senderAccountId = process.env.MY_ACCOUNT_ID;
+		throw new Error(`Invalid NETWORK: ${network}. Use mainnet, testnet, previewnet, or custom`);
+	} const senderAccountId = process.env.MY_ACCOUNT_ID;
 	const privateKey = process.env.MY_PRIVATE_KEY;
 
 	if (!senderAccountId || !privateKey) {
@@ -433,13 +435,15 @@ async function readAirdropFile(filePath, config) {
 		// Check wallet association for tokens (not hbar)
 		let walletAssociated = true;
 		if (tokenId.toLowerCase() !== 'hbar') {
-			let tokenBalMap = tokenBalancesMaps.get(tokenId);
-			if (!tokenBalMap) {
+			// Check if this specific wallet has the token associated
+			walletAssociated = await checkWalletTokenAssociation(receiverWallet, tokenId, config);
+
+			// Still build balance map for sender validation later
+			if (walletAssociated && !tokenBalancesMaps.has(tokenId)) {
 				if (config.verbose) log('INFO', `Building token/balance map for ${tokenId}`, config);
-				tokenBalMap = await getTokenBalanceMap(tokenId, config);
+				const tokenBalMap = await getTokenBalanceMap(tokenId, config);
 				tokenBalancesMaps.set(tokenId, tokenBalMap);
 			}
-			walletAssociated = (tokenBalMap.get(receiverWallet) || 0) >= 0;
 		}
 
 		// Apply exclusions and limits
@@ -484,7 +488,11 @@ async function readAirdropFile(filePath, config) {
  */
 function writeResults(completed, skipped, failed, filename, config) {
 	const timestamp = new Date().toISOString();
-	const baseName = filename.replace(/^\.\//, '').replace(/\.csv$/, '');
+	// Extract just the filename without path or extension
+	const baseName = filename
+		.replace(/\\/g, '/') // normalize Windows paths
+		.split('/').pop() // get just the filename
+		.replace(/\.csv$/i, ''); // remove .csv extension
 
 	// CSV Output (human-readable)
 	const csvFilename = `output_${baseName}_${timestamp.replace(/[:.]/g, '-')}.csv`;
@@ -594,7 +602,54 @@ async function fetchWithTimeout(resource, options = {}) {
 }
 
 /**
- * Get token balance map for all holders
+ * Check if a wallet has a token associated
+ * @param {string} wallet - Wallet address
+ * @param {string} tokenId - Token ID
+ * @param {Config} config - Configuration
+ * @returns {Promise<boolean>}
+ */
+async function checkWalletTokenAssociation(wallet, tokenId, config) {
+	try {
+		const routeUrl = `/api/v1/accounts/${wallet}/tokens?token.id=${tokenId}`;
+		const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
+
+		if (!json || !json.tokens || json.tokens.length === 0) {
+			return false;
+		}
+
+		// Token is associated if it appears in the response
+		return true;
+	} catch (err) {
+		if (config.verbose) log('WARN', `Could not check association for ${wallet}/${tokenId}: ${err.message}`, config);
+		return false;
+	}
+}
+
+/**
+ * Get sender's balance for a specific token
+ * @param {string} tokenId - Token ID
+ * @param {string} accountId - Account ID
+ * @param {Config} config - Configuration
+ * @returns {Promise<number>}
+ */
+async function getSenderTokenBalance(tokenId, accountId, config) {
+	try {
+		const routeUrl = `/api/v1/accounts/${accountId}/tokens?token.id=${tokenId}`;
+		const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
+
+		if (!json || !json.tokens || json.tokens.length === 0) {
+			return 0;
+		}
+
+		return json.tokens[0].balance || 0;
+	} catch (err) {
+		if (config.verbose) log('WARN', `Could not fetch balance for ${accountId}/${tokenId}: ${err.message}`, config);
+		return 0;
+	}
+}
+
+/**
+ * Get token balance map for all holders (only used when needed)
  * @param {string} tokenId - Token ID
  * @param {Config} config - Configuration
  * @returns {Promise<Map<string, number>>}
@@ -602,9 +657,16 @@ async function fetchWithTimeout(resource, options = {}) {
 async function getTokenBalanceMap(tokenId, config) {
 	const tokenBalMap = new Map();
 	let routeUrl = `/api/v1/tokens/${tokenId}/balances/`;
+	let pageCount = 0;
 
 	try {
+		log('INFO', `Fetching balance data for ${tokenId}...`, config);
 		do {
+			pageCount++;
+			if (pageCount % 10 === 0) {
+				process.stdout.write(`\r  Loaded ${tokenBalMap.size} token holders...`);
+			}
+
 			const json = await fetchJson(config.mirrorNodeUrl + routeUrl);
 			if (!json) {
 				console.error(`ERROR: No balances found for ${tokenId}`);
@@ -618,6 +680,9 @@ async function getTokenBalanceMap(tokenId, config) {
 			routeUrl = json.links.next;
 		} while (routeUrl);
 
+		if (pageCount >= 10) {
+			process.stdout.write(`\r  ✓ Loaded ${tokenBalMap.size} token holders\n`);
+		}
 		return tokenBalMap;
 	} catch (err) {
 		console.error(`Error fetching balances for ${tokenId}:`, err);
@@ -709,10 +774,17 @@ async function validateAndPrepareTransfers(transfers, tokenBalancesMaps, config)
 	const serialsOwnedMap = new Map();
 
 	// Build token metadata
+	const uniqueTokens = [...new Set(transfers.map(t => t.tokenId.toLowerCase()))];
+	let tokenIndex = 0;
+	log('INFO', `Analyzing ${uniqueTokens.length} unique token(s)...`, config);
+
 	for (const tfr of transfers) {
 		const tokenId = tfr.tokenId.toLowerCase();
 
 		if (tokenTypeMap.has(tokenId)) continue;
+
+		tokenIndex++;
+		log('INFO', `[${tokenIndex}/${uniqueTokens.length}] Processing ${tokenId}...`, config);
 
 		if (tokenId === 'hbar') {
 			tokenTypeMap.set(tokenId, 'HBAR');
@@ -723,8 +795,8 @@ async function validateAndPrepareTransfers(transfers, tokenBalancesMaps, config)
 			tokenTypeMap.set(tokenId, tokenType);
 			tokenDecimalsMap.set(tokenId, decimals);
 
-			const tknBalMap = tokenBalancesMaps.get(tokenId);
-			const bal = tknBalMap.get(config.senderAccountId) || 0;
+			// Get sender's balance for this token
+			const bal = await getSenderTokenBalance(tokenId, config.senderAccountId, config);
 
 			if (tokenType === 'NON_FUNGIBLE_UNIQUE') {
 				const serialsOwned = await getSerialsOwned(tokenId, config.senderAccountId, config.excludeSerials, config);
@@ -823,6 +895,39 @@ async function validateAndPrepareTransfers(transfers, tokenBalancesMaps, config)
 }
 
 /**
+ * Split large NFT transfers into batches of 10 serials each (Hedera limit)
+ * @param {Transaction[]} nftTransfers - NFT transfers to split
+ * @returns {Transaction[]} - Batched transfers
+ */
+function splitNftTransfersIntoBatches(nftTransfers) {
+	const NFT_BATCH_SIZE = 10;
+	const batched = [];
+
+	for (const tfr of nftTransfers) {
+		if (tfr.serialArray.length <= NFT_BATCH_SIZE) {
+			batched.push(tfr);
+		} else {
+			// Split into multiple transactions
+			for (let i = 0; i < tfr.serialArray.length; i += NFT_BATCH_SIZE) {
+				const batchSerials = tfr.serialArray.slice(i, i + NFT_BATCH_SIZE);
+				const batchTfr = new Transaction(
+					tfr.receiverWallet,
+					tfr.tokenId,
+					batchSerials.length,
+					batchSerials
+				);
+				batchTfr.originalTransferSize = tfr.serialArray.length; // Track original size
+				batchTfr.batchNumber = Math.floor(i / NFT_BATCH_SIZE) + 1;
+				batchTfr.totalBatches = Math.ceil(tfr.serialArray.length / NFT_BATCH_SIZE);
+				batched.push(batchTfr);
+			}
+		}
+	}
+
+	return batched;
+}
+
+/**
  * Execute a single transfer transaction
  * @param {Transaction} tfr - Transfer to execute
  * @param {Client} client - Hedera client
@@ -833,11 +938,11 @@ async function validateAndPrepareTransfers(transfers, tokenBalancesMaps, config)
  */
 async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecimalsMap) {
 	try {
-		const tokenTransferTx = new TransferTransaction();
 		const tokenId = tfr.tokenId.toLowerCase();
 
 		if (tokenId === 'hbar') {
 			// HBAR transfer
+			const tokenTransferTx = new TransferTransaction();
 			tokenTransferTx.addHbarTransfer(tfr.receiverWallet, new Hbar(tfr.quantity, HbarUnit.Hbar));
 
 			if (config.isApproval) {
@@ -847,13 +952,46 @@ async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecim
 			} else {
 				tokenTransferTx.addHbarTransfer(config.senderAccountId, new Hbar(-tfr.quantity, HbarUnit.Hbar));
 			}
+
+			tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
+			const signedTx = await tokenTransferTx.sign(privateKey);
+			const txSubmit = await signedTx.execute(client);
+			const receipt = await txSubmit.getReceipt(client);
+
+			tfr.txId = txSubmit.transactionId.toString();
+			tfr.success = receipt.status.toString() === 'SUCCESS';
+			tfr.message = tfr.success ? 'Completed' : `Failed: ${receipt.status.toString()}`;
+
+			return tfr.success;
 		} else if (tfr.serialArray.length > 0 && tfr.serialArray[0] !== 0) {
-			// NFT transfer
+			// NFT transfer (already batched to max 10 serials)
+			const tokenTransferTx = new TransferTransaction();
+
 			for (const serial of tfr.serialArray) {
 				tokenTransferTx.addNftTransfer(tokenId, serial, config.senderAccountId, tfr.receiverWallet);
 			}
+
+			tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
+			const signedTx = await tokenTransferTx.sign(privateKey);
+			const txSubmit = await signedTx.execute(client);
+			const receipt = await txSubmit.getReceipt(client);
+
+			tfr.txId = txSubmit.transactionId.toString();
+			tfr.success = receipt.status.toString() === 'SUCCESS';
+
+			if (tfr.success) {
+				const batchInfo = tfr.totalBatches > 1
+					? ` (batch ${tfr.batchNumber}/${tfr.totalBatches})`
+					: '';
+				tfr.message = `Completed${batchInfo}`;
+			} else {
+				tfr.message = `Failed: ${receipt.status.toString()}`;
+			}
+
+			return tfr.success;
 		} else {
 			// Fungible token transfer
+			const tokenTransferTx = new TransferTransaction();
 			const decimals = tokenDecimalsMap.get(tokenId) || 0;
 			const adjustedQty = tfr.quantity * Math.pow(10, decimals);
 
@@ -866,18 +1004,18 @@ async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecim
 			} else {
 				tokenTransferTx.addTokenTransfer(tokenId, config.senderAccountId, -adjustedQty);
 			}
+
+			tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
+			const signedTx = await tokenTransferTx.sign(privateKey);
+			const txSubmit = await signedTx.execute(client);
+			const receipt = await txSubmit.getReceipt(client);
+
+			tfr.txId = txSubmit.transactionId.toString();
+			tfr.success = receipt.status.toString() === 'SUCCESS';
+			tfr.message = tfr.success ? 'Completed' : `Failed: ${receipt.status.toString()}`;
+
+			return tfr.success;
 		}
-
-		tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
-		const signedTx = await tokenTransferTx.sign(privateKey);
-		const txSubmit = await signedTx.execute(client);
-		const receipt = await txSubmit.getReceipt(client);
-
-		tfr.txId = txSubmit.transactionId.toString();
-		tfr.success = receipt.status.toString() === 'SUCCESS';
-		tfr.message = tfr.success ? 'Completed' : `Failed: ${receipt.status.toString()}`;
-
-		return tfr.success;
 	} catch (err) {
 		tfr.success = false;
 		tfr.message = `Error: ${err.message}`;
@@ -914,7 +1052,9 @@ async function processTransfersParallel(transfers, tokenDecimalsMap, config, tes
 
 	const completed = [];
 	const failed = [];
-	let processed = 0;
+	let totalProcessed = 0;
+	let totalSuccess = 0;
+	let totalFailed = 0;
 
 	// Process in batches with concurrency limit
 	for (let i = 0; i < transfers.length; i += config.maxConcurrentTxs) {
@@ -932,6 +1072,7 @@ async function processTransfersParallel(transfers, tokenDecimalsMap, config, tes
 
 			if (result.status === 'fulfilled' && tfr.success) {
 				completed.push(tfr);
+				totalSuccess++;
 			} else {
 				// Retry once on failure
 				if (tfr.retryCount === 0) {
@@ -943,16 +1084,20 @@ async function processTransfersParallel(transfers, tokenDecimalsMap, config, tes
 
 					if (retrySuccess) {
 						completed.push(tfr);
+						totalSuccess++;
 					} else {
 						failed.push(tfr);
+						totalFailed++;
 					}
 				} else {
 					failed.push(tfr);
+					totalFailed++;
 				}
 			}
 
-			processed++;
-			showProgress(processed, transfers.length, 'Sending transfers');
+			totalProcessed++;
+			const progressMsg = `Processed: ${totalProcessed}/${transfers.length} | Success: ${totalSuccess} | Failed: ${totalFailed}`;
+			showProgress(totalProcessed, transfers.length, progressMsg);
 		}
 
 		// Rate limiting: brief pause between batches
@@ -962,6 +1107,7 @@ async function processTransfersParallel(transfers, tokenDecimalsMap, config, tes
 	}
 
 	client.close();
+	log('INFO', `\nFinal Results: ${totalSuccess} succeeded, ${totalFailed} failed out of ${transfers.length} total`, config);
 	return [completed, failed];
 }
 
@@ -1020,26 +1166,37 @@ async function main() {
 	console.log('╚════════════════════════════════════════════════════════════╝\n');
 
 	if (getArgFlag('h') || getArgFlag('help')) {
-		console.log('Usage: node tokenAirdrop.js -process <file> [options]');
+		console.log('Usage: node tokenAirdrop.js <file> [options]');
+		console.log('\nArguments:');
+		console.log('  <file>             CSV file with airdrop data (required)');
 		console.log('\nOptions:');
-		console.log('  -process <file>    CSV file with airdrop data (required)');
 		console.log('  -test              Validate without sending transactions');
 		console.log('  -validate          Alias for -test');
 		console.log('  -resume            Resume from checkpoint if available');
 		console.log('  -approval <id>     Use allowance from account <id>');
 		console.log('  -v                 Verbose logging');
 		console.log('  -h, -help          Show this help message');
-		console.log('\nExample:');
+		console.log('\nExamples:');
+		console.log('  node tokenAirdrop.js my-airdrop.csv');
+		console.log('  node tokenAirdrop.js my-airdrop.csv -test');
+		console.log('  node tokenAirdrop.js my-airdrop.csv -resume');
+		console.log('\nLegacy format (still supported):');
 		console.log('  node tokenAirdrop.js -process my-airdrop.csv');
-		console.log('  node tokenAirdrop.js -process my-airdrop.csv -test');
-		console.log('  node tokenAirdrop.js -process my-airdrop.csv -resume');
 		console.log('\nSee README.md for detailed documentation.');
 		return;
 	}
 
-	const processFile = getArg('process');
+	// Get file from first positional argument or legacy -process flag
+	let processFile = process.argv[2];
+
+	// Skip if it's a flag
+	if (processFile && processFile.startsWith('-')) {
+		processFile = getArg('process');
+	}
+
 	if (!processFile) {
-		console.error('ERROR: Must specify -process <file>');
+		console.error('ERROR: Must specify a CSV file');
+		console.log('\nUsage: node tokenAirdrop.js <file> [options]');
 		console.log('Run with -h for help');
 		return;
 	}
@@ -1103,7 +1260,14 @@ async function main() {
 
 		skipped.push(...validationSkipped);
 
-		const allTransfers = [...nftTransfers, ...ftTransfers, ...hbarTransfers];
+		// Split large NFT transfers into batches of 10 (Hedera transaction limit)
+		const batchedNftTransfers = splitNftTransfersIntoBatches(nftTransfers);
+
+		if (batchedNftTransfers.length > nftTransfers.length) {
+			log('INFO', `Split ${nftTransfers.length} NFT transfers into ${batchedNftTransfers.length} transaction batches`, config);
+		}
+
+		const allTransfers = [...batchedNftTransfers, ...ftTransfers, ...hbarTransfers];
 
 		if (testMode) {
 			console.log('\n' + '='.repeat(60));

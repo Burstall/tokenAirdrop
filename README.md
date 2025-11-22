@@ -57,7 +57,7 @@ A powerful, production-ready tool for distributing tokens (NFTs, Fungible Tokens
 
 5. **Run a test**
    ```bash
-   node tokenAirdrop.js -process your-airdrop.csv -test
+   node tokenAirdrop.js your-airdrop.csv -test
    ```
 
 ## ⚙️ Configuration
@@ -158,42 +158,49 @@ Your airdrop file should be a CSV with the following format:
 
 Send tokens to recipients:
 ```bash
-node tokenAirdrop.js -process my-airdrop.csv
+node tokenAirdrop.js my-airdrop.csv
 ```
 
 ### Test Mode (Validation Only)
 
 Validate your airdrop file without sending anything:
 ```bash
-node tokenAirdrop.js -process my-airdrop.csv -test
+node tokenAirdrop.js my-airdrop.csv -test
 ```
 
 ### Resume Failed Airdrop
 
 If your airdrop was interrupted or had failures, resume from checkpoint:
 ```bash
-node tokenAirdrop.js -process my-airdrop.csv -resume
+node tokenAirdrop.js my-airdrop.csv -resume
 ```
 
 ### Using Allowance
 
 Send tokens from an approved allowance:
 ```bash
-node tokenAirdrop.js -process my-airdrop.csv -approval 0.0.999999
+node tokenAirdrop.js my-airdrop.csv -approval 0.0.999999
 ```
 
 ### Verbose Mode
 
 Enable detailed logging for debugging:
 ```bash
-node tokenAirdrop.js -process my-airdrop.csv -v
+node tokenAirdrop.js my-airdrop.csv -v
+```
+
+### Legacy Format (Still Supported)
+
+The old `-process` flag still works:
+```bash
+node tokenAirdrop.js -process my-airdrop.csv
 ```
 
 ## 🎛️ Command Line Options
 
 | Option | Description | Example |
 |--------|-------------|---------|
-| `-process <file>` | **Required.** CSV file with airdrop data | `-process airdrop.csv` |
+| `<file>` | **Required.** CSV file with airdrop data | `my-airdrop.csv` |
 | `-test` | Validate without sending transactions | `-test` |
 | `-validate` | Alias for `-test` | `-validate` |
 | `-resume` | Resume from checkpoint (for failed runs) | `-resume` |

@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "test": "node tokenAirdrop.js -h",
-    "airdrop": "node tokenAirdrop.js"
+    "airdrop": "node tokenAirdrop.js",
+    "example": "node tokenAirdrop.js example-airdrop.csv -test"
   },
   "keywords": [
     "hbar",
