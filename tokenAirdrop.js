@@ -748,6 +748,42 @@ async function getTokenType(tokenId, config) {
 	return [json.type, json.decimals];
 }
 
+/**
+ * Look up a transaction's consensus result on the mirror node.
+ * Used to detect a tx that actually reached consensus even though the client
+ * failed to fetch its receipt — avoids a blind resubmit that would collide
+ * (e.g. SENDER_DOES_NOT_OWN_NFT_SERIAL_NO when the original already moved the NFT).
+ * @param {string} txId - SDK transaction id (e.g. 0.0.x@sss.nnnnnnnnn)
+ * @param {Config} config - Configuration
+ * @returns {Promise<string|null>} - Result string (e.g. 'SUCCESS') or null if not found
+ */
+async function getTxResultFromMirror(txId, config) {
+	if (!txId) return null;
+
+	const [acct, ts] = txId.split('@');
+	if (!acct || !ts) return null;
+	const mirrorId = `${acct}-${ts.replace('.', '-')}`;
+	const url = `${config.mirrorNodeUrl}/api/v1/transactions/${mirrorId}`;
+
+	// Poll briefly to allow for mirror node ingestion lag (typically a few seconds)
+	for (let attempt = 0; attempt < 6; attempt++) {
+		try {
+			const res = await fetchWithTimeout(url, { timeout: 15000 });
+			if (res.status === 200) {
+				const json = await res.json();
+				if (json && Array.isArray(json.transactions) && json.transactions.length > 0) {
+					return json.transactions[0].result;
+				}
+			}
+		} catch (_err) {
+			// Ignore and retry
+		}
+		await sleep(2000);
+	}
+
+	return null;
+}
+
 // ============================================================================
 // TRANSACTION PROCESSING
 // ============================================================================
@@ -956,9 +992,9 @@ async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecim
 			tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
 			const signedTx = await tokenTransferTx.sign(privateKey);
 			const txSubmit = await signedTx.execute(client);
+			tfr.txId = txSubmit.transactionId.toString();
 			const receipt = await txSubmit.getReceipt(client);
 
-			tfr.txId = txSubmit.transactionId.toString();
 			tfr.success = receipt.status.toString() === 'SUCCESS';
 			tfr.message = tfr.success ? 'Completed' : `Failed: ${receipt.status.toString()}`;
 
@@ -974,9 +1010,9 @@ async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecim
 			tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
 			const signedTx = await tokenTransferTx.sign(privateKey);
 			const txSubmit = await signedTx.execute(client);
+			tfr.txId = txSubmit.transactionId.toString();
 			const receipt = await txSubmit.getReceipt(client);
 
-			tfr.txId = txSubmit.transactionId.toString();
 			tfr.success = receipt.status.toString() === 'SUCCESS';
 
 			if (tfr.success) {
@@ -1008,9 +1044,9 @@ async function executeSingleTransfer(tfr, client, privateKey, config, tokenDecim
 			tokenTransferTx.setTransactionMemo(config.memo).freezeWith(client);
 			const signedTx = await tokenTransferTx.sign(privateKey);
 			const txSubmit = await signedTx.execute(client);
+			tfr.txId = txSubmit.transactionId.toString();
 			const receipt = await txSubmit.getReceipt(client);
 
-			tfr.txId = txSubmit.transactionId.toString();
 			tfr.success = receipt.status.toString() === 'SUCCESS';
 			tfr.message = tfr.success ? 'Completed' : `Failed: ${receipt.status.toString()}`;
 
@@ -1074,8 +1110,17 @@ async function processTransfersParallel(transfers, tokenDecimalsMap, config, tes
 				completed.push(tfr);
 				totalSuccess++;
 			} else {
-				// Retry once on failure
-				if (tfr.retryCount === 0) {
+				// If the prior attempt actually reached consensus (e.g. the client
+				// timed out fetching the receipt), don't blind-resubmit — that collides
+				// (e.g. SENDER_DOES_NOT_OWN_NFT_SERIAL_NO on the retry).
+				const priorResult = tfr.retryCount === 0 ? await getTxResultFromMirror(tfr.txId, config) : null;
+				if (priorResult === 'SUCCESS') {
+					tfr.success = true;
+					tfr.message = 'Completed (confirmed via mirror node after receipt timeout)';
+					log('INFO', `Transfer to ${tfr.receiverWallet} already succeeded on-chain (${tfr.txId}); skipping retry`, config);
+					completed.push(tfr);
+					totalSuccess++;
+				} else if (tfr.retryCount === 0) {
 					tfr.retryCount++;
 					log('WARN', `Retrying failed transfer to ${tfr.receiverWallet}`, config);
 
